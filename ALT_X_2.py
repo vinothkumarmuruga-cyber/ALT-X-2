@@ -760,20 +760,25 @@ def fetch_today_live_ohlc(instrument_keys, headers):
 
 def _resolve_atl_status(row):
     """
-    Combines the cached historical result with today's live overlay.
-    Returns (status, fresh_entry_today) — fresh_entry_today is True only
-    when entry is crossing for the very first time TODAY (used to decide
-    whether to fire a Telegram alert, so old look-back-window entries
-    from previous days don't all alert at once on a fresh app load).
+    Combines the cached historical result (simulate_trade over the whole
+    look-back window) with today's live overlay to get a single current
+    status: "Not Triggered" / "Open" / "TGT Hit" / "SL Hit". Whether this
+    is the very first day Entry was ever crossed (vs. having already
+    triggered on some earlier day within the look-back window) makes no
+    difference here — that distinction used to gate the Telegram alert,
+    but doing so meant most contracts (having likely crossed 2x-ATL at
+    some point over the whole look-back window already) could never
+    alert at all. See check_and_alert_atl for how alerting is decided
+    now — it dedupes per calendar day instead, off this Status value.
     """
     hist = row["_hist_status"]
     entry, tgt, sl = row["Entry"], row["TGT"], row["SL"]
     today_high, today_low = row.get("today_high"), row.get("today_low")
 
     if hist == "TARGET":
-        return "TGT Hit", False
+        return "TGT Hit"
     if hist == "SL":
-        return "SL Hit", False
+        return "SL Hit"
 
     if hist == "OPEN":
         # Entry already triggered on a past day within the look-back
@@ -781,33 +786,40 @@ def _resolve_atl_status(row):
         hit_tgt = pd.notna(today_high) and today_high >= tgt
         hit_sl = pd.notna(today_low) and today_low <= sl
         if hit_sl:
-            return "SL Hit", False  # same tie-break as simulate_trade
+            return "SL Hit"  # same tie-break as simulate_trade
         if hit_tgt:
-            return "TGT Hit", False
-        return "Open", False
+            return "TGT Hit"
+        return "Open"
 
     # hist == "NOT_TRIGGERED": entry not yet hit as of yesterday's close.
     hit_entry_today = pd.notna(today_high) and today_high >= entry
     if not hit_entry_today:
-        return "Not Triggered", False
+        return "Not Triggered"
 
     hit_tgt = pd.notna(today_high) and today_high >= tgt
     hit_sl = pd.notna(today_low) and today_low <= sl
     if hit_sl:
-        return "SL Hit", True
+        return "SL Hit"
     if hit_tgt:
-        return "TGT Hit", True
-    return "Open", True
+        return "TGT Hit"
+    return "Open"
 
 
 def check_and_alert_atl(df, telegram_enabled, bot_token, chat_id):
     """
-    ATL scanner: alerts the moment an option's Entry level (2x ATL) is
-    crossed for the FIRST time TODAY. Deliberately does NOT alert on
-    contracts whose entry already triggered on an earlier day within the
-    look-back window (those show up as "Open"/"TGT Hit"/"SL Hit" from the
-    historical pass) — otherwise a fresh app load would flood Telegram
-    with every already-triggered contract across the whole window.
+    ATL x2 scanner: alerts once per symbol per calendar day the first
+    time it shows up in `df` — i.e. the first time this refresh sees it
+    with a genuinely triggered Status (Open / TGT Hit / SL Hit; rows
+    with "Not Triggered" are already filtered out before this is
+    called — see build_atl_scanner). This intentionally does NOT
+    require the crossing to have happened specifically today: a
+    contract that was already triggered on an earlier day within the
+    look-back window still alerts once, the first refresh after alerts
+    are turned on / a new trading day starts, exactly like any other
+    contract. De-duplication is per-day via the persisted alert-state
+    file (tagged "ATL:<symbol>", reset automatically each trading day),
+    so each symbol only ever sends one Telegram message per day no
+    matter how many refreshes happen.
     """
     if not telegram_enabled:
         return
@@ -818,8 +830,6 @@ def check_and_alert_atl(df, telegram_enabled, bot_token, chat_id):
     newly_triggered = []
 
     for _, row in df.iterrows():
-        if not row.get("_fresh_entry_today"):
-            continue
         symbol = row.get("Symbol")
         if not symbol:
             continue
@@ -952,9 +962,7 @@ def build_atl_scanner(access_token, expiry_choice, start_date):
     live_ohlc = fetch_today_live_ohlc(selected["option_key"].tolist(), headers)
     selected = selected.merge(live_ohlc, left_on="option_key", right_on="instrument_key", how="left")
 
-    status_and_fresh = selected.apply(_resolve_atl_status, axis=1, result_type="expand")
-    selected["Status"] = status_and_fresh[0]
-    selected["_fresh_entry_today"] = status_and_fresh[1]
+    selected["Status"] = selected.apply(_resolve_atl_status, axis=1)
 
     selected["LTP"] = pd.to_numeric(selected["today_ltp"], errors="coerce")
     selected["Away %"] = np.where(
@@ -967,7 +975,7 @@ def build_atl_scanner(access_token, expiry_choice, start_date):
 
     result = selected[[
         "Symbol", "LTP", "ATL", "ATL Date", "Entry", "Away %", "TGT", "SL",
-        "Status", "_fresh_entry_today", "Lot", "Cap"
+        "Status", "Lot", "Cap"
     ]].copy()
 
     for col in ["LTP", "ATL", "Entry", "Away %", "TGT", "SL"]:
@@ -996,10 +1004,9 @@ DECIMAL_COLS_ATL = {
     "SL": "{:.2f}",
 }
 
-# "_fresh_entry_today" is internal-only (drives the Telegram alert, see
-# check_and_alert_atl). "Status" is likewise internal-only now (used to
-# filter to genuinely-triggered contracts and to detect a fresh entry) —
-# both deliberately excluded from display.
+# "Status" is internal-only — used to filter to genuinely-triggered
+# contracts (build_atl_scanner) and to decide alert eligibility
+# (check_and_alert_atl) — and deliberately excluded from display.
 DISPLAY_COLS_ATL = ["Symbol", "LTP", "ATL", "ATL Date", "Entry", "Away %", "TGT", "SL", "Lot", "Cap"]
 
 CE_ATL_TINTS = {
