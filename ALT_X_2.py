@@ -807,19 +807,23 @@ def _resolve_atl_status(row):
 
 def check_and_alert_atl(df, telegram_enabled, bot_token, chat_id):
     """
-    ATL x2 scanner: alerts once per symbol per calendar day the first
-    time it shows up in `df` — i.e. the first time this refresh sees it
-    with a genuinely triggered Status (Open / TGT Hit / SL Hit; rows
-    with "Not Triggered" are already filtered out before this is
-    called — see build_atl_scanner). This intentionally does NOT
-    require the crossing to have happened specifically today: a
-    contract that was already triggered on an earlier day within the
-    look-back window still alerts once, the first refresh after alerts
-    are turned on / a new trading day starts, exactly like any other
-    contract. De-duplication is per-day via the persisted alert-state
-    file (tagged "ATL:<symbol>", reset automatically each trading day),
-    so each symbol only ever sends one Telegram message per day no
-    matter how many refreshes happen.
+    ATL x2 scanner: alerts a symbol the moment its live LTP is actually
+    AT OR ABOVE its Entry price (LTP >= Entry) — checked fresh every
+    refresh off the current quote, not off the historical Status. This
+    matters because Status ("Open" in particular) reflects a contract
+    that triggered on ANY day within the whole look-back window and
+    stays "Open" even if price has since fallen back below Entry — that
+    is correct for the table (matches the reference backtest's "keep
+    every entered trade listed" behaviour) but would be wrong for
+    alerting: a contract sitting at "Open" with today's LTP now well
+    below Entry has NOT just crossed anything and must not alert. Using
+    row["LTP"] >= row["Entry"] directly means only symbols where price
+    is genuinely at/above Entry right now are ever considered.
+
+    Still de-duplicated per calendar day via the persisted alert-state
+    file (tagged "ATL:<symbol>", reset automatically each trading day)
+    so a symbol that stays above Entry for hours only sends ONE Telegram
+    message that day, not one every refresh.
     """
     if not telegram_enabled:
         return
@@ -833,6 +837,11 @@ def check_and_alert_atl(df, telegram_enabled, bot_token, chat_id):
         symbol = row.get("Symbol")
         if not symbol:
             continue
+
+        ltp, entry = row.get("LTP"), row.get("Entry")
+        if pd.isna(ltp) or pd.isna(entry) or ltp < entry:
+            continue  # LTP hasn't actually crossed Entry (yet, or anymore)
+
         alert_id = f"ATL:{symbol}"
         if alert_id not in alerted:
             newly_triggered.append((alert_id, row))
