@@ -358,16 +358,83 @@ def fetch_future_open_v3(instrument_keys, headers):
                 "future_ltp": item.get("last_price"),
             })
     return pd.DataFrame(rows), raw_sample
-def nearest_option(options_df, underlying_key, expiry, option_type, future_open):
+def nearest_option(options_df, underlying_key, expiry, option_type, ref_price):
+    """
+    ref_price is the reference price the "nearest strike" is measured
+    against — this used to be the future's TODAY open (changed every day,
+    so the ATM CE/PE picked also changed every day). It is now the
+    future's MONTHLY open (see fetch_monthly_open_map below) so the
+    selected CE/PE strike stays fixed for the whole calendar month.
+    """
     chain = options_df[
         (options_df["underlying_key"] == underlying_key) &
         (options_df["expiry_date"] == expiry) &
         (options_df["instrument_type"] == option_type)
     ].copy()
-    if chain.empty or pd.isna(future_open):
+    if chain.empty or pd.isna(ref_price):
         return None
-    chain["strike_diff"] = (chain["strike_price"] - future_open).abs()
+    chain["strike_diff"] = (chain["strike_price"] - ref_price).abs()
     return chain.sort_values("strike_diff").iloc[0]
+# ============================================================
+# MONTHLY OPEN (strike-selection reference price)
+#
+# Strike selection (nearest_option, above) used to be re-anchored every
+# day to that day's futures open, so the ATM CE/PE tracked could change
+# daily. This instead locks the reference price to the future's open on
+# the FIRST TRADING DAY OF THE CURRENT CALENDAR MONTH, so the same CE/PE
+# strike is tracked all month.
+#
+# fetch_monthly_open_single reuses fetch_atl_history (already defined
+# above, further down the file) to pull daily candles for the future
+# from the 1st of the month up to a "probe window" end date, and takes
+# the OPEN of the earliest candle in that range — i.e. the open of
+# whichever day the month's trading actually started on (handles
+# month-start weekends/holidays correctly).
+#
+# The probe window end is capped at month_start + 10 days once we're
+# far enough into the month, instead of always using "yesterday" — this
+# keeps the (month_start, probe_end) cache key STABLE for the rest of
+# the month, so this heavy historical pass runs once a month per future
+# instead of being re-fetched every single day.
+#
+# On the month's very first trading day itself there is no completed
+# daily candle yet at all (historical endpoints don't return today's
+# still-forming candle) — build_atl_scanner falls back to today's live
+# open (from fetch_future_open_v3) for that one day only; every day
+# after that, the real monthly-open candle is picked up and the
+# reference price stays fixed.
+# ============================================================
+MONTHLY_OPEN_PROBE_DAYS = 10
+def fetch_monthly_open_single(instrument_key, headers, month_start, probe_end, max_retries=2):
+    candles = fetch_atl_history(instrument_key, headers, month_start, probe_end, max_retries)
+    if candles is None or candles.empty:
+        return instrument_key, None
+    first_open = candles.iloc[0]["open"]
+    if first_open in (None, 0) or pd.isna(first_open):
+        return instrument_key, None
+    return instrument_key, float(first_open)
+@st.cache_data(ttl=None, show_spinner="Fetching monthly open prices...")
+def fetch_monthly_open_map(instrument_keys, headers_tuple, month_start_iso, probe_end_iso):
+    headers = dict(headers_tuple)
+    month_start = datetime.strptime(month_start_iso, "%Y-%m-%d").date()
+    probe_end = datetime.strptime(probe_end_iso, "%Y-%m-%d").date()
+    result = {}
+    instrument_keys = list(instrument_keys)
+    batch_size = 10
+    pause_between_batches = 0.6
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        for i in range(0, len(instrument_keys), batch_size):
+            batch = instrument_keys[i:i + batch_size]
+            futures_map = {
+                executor.submit(fetch_monthly_open_single, key, headers, month_start, probe_end): key
+                for key in batch
+            }
+            for future in as_completed(futures_map):
+                key, open_price = future.result()
+                result[key] = open_price
+            if i + batch_size < len(instrument_keys):
+                time.sleep(pause_between_batches)
+    return result
 def table_height(df, row_px=35, header_px=38, max_px=900):
     return min(header_px + row_px * max(len(df), 1) + 3, max_px)
 def style_away_percent(value):
@@ -711,10 +778,33 @@ def build_atl_scanner(access_token, expiry_choice, start_date):
     if fut_quotes.empty:
         st.error("No futures open data received")
         return pd.DataFrame(), pd.DataFrame()
-    futures = futures.merge(fut_quotes, on="instrument_key", how="left")
+    # Strike selection reference price = MONTHLY open (fixed for the whole
+    # calendar month), not today's open — see the "MONTHLY OPEN" section
+    # above for why. today's live open (fut_quotes, already fetched above)
+    # is used only as a fallback on the month's very first trading day,
+    # when no completed monthly-open candle exists yet.
+    today_ist = get_ist_now().date()
+    month_start = today_ist.replace(day=1)
+    probe_end = min(month_start + timedelta(days=MONTHLY_OPEN_PROBE_DAYS), today_ist - timedelta(days=1))
+    if probe_end >= month_start:
+        monthly_open_map = fetch_monthly_open_map(
+            tuple(sorted(futures["instrument_key"].unique())),
+            tuple(headers.items()),
+            month_start.isoformat(),
+            probe_end.isoformat(),
+        )
+    else:
+        monthly_open_map = {}  # today IS the month's first trading day — nothing to probe yet
+    today_open_map = dict(zip(fut_quotes["instrument_key"], fut_quotes["future_open"]))
+    def _resolve_monthly_open(key):
+        val = monthly_open_map.get(key)
+        if val is None or pd.isna(val):
+            return today_open_map.get(key)  # month's first trading day fallback
+        return val
+    futures["future_open"] = futures["instrument_key"].apply(_resolve_monthly_open)
     futures = futures.dropna(subset=["future_open"])
     if futures.empty:
-        st.error("All futures were dropped after the Open-price fetch.")
+        st.error("All futures were dropped after the Monthly-Open fetch.")
         return pd.DataFrame(), pd.DataFrame()
     selected_rows = []
     for _, fut in futures.iterrows():
