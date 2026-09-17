@@ -465,7 +465,10 @@ def apply_column_tints(styler, tints):
 #   TGT   = Entry x EXIT_MULT (2.0)   [ = ATL x 4.0 ]
 #   SL    = Entry x SL_MULT (0.5)     e.g. Entry=98.60 -> SL=49.30
 #   (all three multipliers live right here, at the top of this section —
-#   change them here if the rule ever changes.)
+#   change them here if the rule ever changes.) TGT/SL/Lot/Cap are still
+#   computed internally (used for the Telegram alert message and the
+#   alert log) but are no longer shown in the on-screen table — see
+#   DISPLAY_COLS_ATL below.
 #
 #   Status (Open / TGT Hit / SL Hit / Not Triggered) is resolved in two
 #   layers, purely internally — it is used to decide WHICH contracts
@@ -869,6 +872,10 @@ def build_atl_scanner(access_token, expiry_choice, start_date):
     )
     selected["Away %"] = selected["Away %"].clip(lower=0)
     selected["Cap"] = selected["LTP"] * selected["Lot"]
+    # TGT, SL, Lot, Cap are kept in `result` even though they are no
+    # longer shown in the table (DISPLAY_COLS_ATL below) — they're still
+    # needed internally by check_and_alert_atl for the Telegram message
+    # and the alert log.
     result = selected[[
         "Symbol", "LTP", "ATL", "ATL Date", "Entry", "Away %", "TGT", "SL",
         "Status", "Lot", "Cap"
@@ -894,22 +901,18 @@ DECIMAL_COLS_ATL = {
     "ATL": "{:.2f}",
     "Entry": "{:.2f}",
     "Away %": "{:.2f}%",
-    "TGT": "{:.2f}",
-    "SL": "{:.2f}",
 }
 # "Status" is internal-only — used to filter to genuinely-triggered
 # contracts (build_atl_scanner) and to decide alert eligibility
 # (check_and_alert_atl) — and deliberately excluded from display.
-DISPLAY_COLS_ATL = ["Symbol", "LTP", "ATL", "ATL Date", "Entry", "Away %", "TGT", "SL", "Lot", "Cap"]
+# TGT, SL, Lot and Cap are likewise kept out of the displayed table (they
+# still exist on the underlying DataFrame for the Telegram alert / log).
+DISPLAY_COLS_ATL = ["Symbol", "LTP", "ATL", "ATL Date", "Entry", "Away %"]
 CE_ATL_TINTS = {
     "Entry": {"background-color": "#E3F2FD", "color": "#0D47A1", "font-weight": "600"},
-    "TGT": {"background-color": "#E8F5E9", "color": "#1B5E20", "font-weight": "600"},
-    "SL": {"background-color": "#FFEBEE", "color": "#B71C1C", "font-weight": "600"},
 }
 PE_ATL_TINTS = {
     "Entry": {"background-color": "#EDE7F6", "color": "#4527A0", "font-weight": "600"},
-    "TGT": {"background-color": "#E0F2F1", "color": "#00695C", "font-weight": "600"},
-    "SL": {"background-color": "#FFF3E0", "color": "#E65100", "font-weight": "600"},
 }
 def show_atl_side_by_side(ce_table, pe_table):
     last_updated = get_ist_now().strftime("%H:%M:%S")
