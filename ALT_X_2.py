@@ -69,6 +69,7 @@ if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 TOKEN_FILE = os.path.join(DATA_DIR, "token.json")
 TRIGGER_ALERT_FILE = os.path.join(DATA_DIR, "trigger_alert_state.json")
+LAST_LTP_FILE = os.path.join(DATA_DIR, "last_ltp_state.json")
 ALERT_LOG_FILE = os.path.join(DATA_DIR, "alert_log.csv")
 # ============================================================
 # OPTIONAL EXTERNAL PERSISTENCE (GitHub Gist)
@@ -232,6 +233,54 @@ def save_trigger_alert_state(keys):
         pass
     if USE_GIST_PERSISTENCE:
         _gist_write_file("trigger_alert_state.json", json.dumps(data))
+# ============================================================
+# LAST-SEEN LTP STATE — the baseline check_and_alert_atl uses to detect a
+# genuine Entry CROSSOVER (previous LTP below Entry, current LTP at/above
+# it) instead of just "LTP happens to be >= Entry right now". Without this,
+# enabling Telegram alerts, restarting the app, or clicking "Reset Alerts"
+# while a contract is already sitting well past Entry (e.g. Away % 127%,
+# 192%) fires an immediate, stale-looking alert for a move that may have
+# happened hours earlier. Persisted (+ Gist-backed, same as the alert-dedup
+# state) and reset each new trading day. Each entry is "<symbol>": <ltp>.
+# ============================================================
+def load_last_ltp_state():
+    today_str = get_ist_now().strftime("%Y-%m-%d")
+    if os.path.exists(LAST_LTP_FILE):
+        try:
+            with open(LAST_LTP_FILE, "r") as f:
+                data = json.load(f)
+                if data.get("date") == today_str:
+                    return dict(data.get("ltp", {}))
+        except:
+            pass
+    if USE_GIST_PERSISTENCE:
+        raw = _gist_read_file("last_ltp_state.json")
+        if raw:
+            try:
+                data = json.loads(raw)
+                if data.get("date") == today_str:
+                    ltp_map = dict(data.get("ltp", {}))
+                    try:
+                        with open(LAST_LTP_FILE, "w") as f:
+                            json.dump({"date": today_str, "ltp": ltp_map}, f)
+                    except:
+                        pass
+                    return ltp_map
+            except Exception:
+                pass
+    return {}
+def save_last_ltp_state(ltp_map):
+    data = {
+        "date": get_ist_now().strftime("%Y-%m-%d"),
+        "ltp": ltp_map
+    }
+    try:
+        with open(LAST_LTP_FILE, "w") as f:
+            json.dump(data, f)
+    except:
+        pass
+    if USE_GIST_PERSISTENCE:
+        _gist_write_file("last_ltp_state.json", json.dumps(data))
 # ============================================================
 # ALERT LOG (CSV) — every fired ATL x2 alert gets one row here: when it
 # crossed, at what LTP, and what the Entry/TGT/SL levels were at that
@@ -706,39 +755,59 @@ def _resolve_atl_status(row):
     return "Open"
 def check_and_alert_atl(df, telegram_enabled, bot_token, chat_id):
     """
-    ATL x2 scanner: alerts a symbol the moment its live LTP is actually
-    AT OR ABOVE its Entry price (LTP >= Entry) — checked fresh every
-    refresh off the current quote, not off the historical Status. This
-    matters because Status ("Open" in particular) reflects a contract
-    that triggered on ANY day within the whole look-back window and
-    stays "Open" even if price has since fallen back below Entry — that
-    is correct for the table (matches the reference backtest's "keep
-    every entered trade listed" behaviour) but would be wrong for
-    alerting: a contract sitting at "Open" with today's LTP now well
-    below Entry has NOT just crossed anything and must not alert. Using
-    row["LTP"] >= row["Entry"] directly means only symbols where price
-    is genuinely at/above Entry right now are ever considered.
+    ATL x2 scanner: alerts a symbol only on a genuine FRESH CROSSOVER of
+    its Entry level — the previously-seen LTP was below Entry and the
+    current LTP is at/above it. This is checked fresh every refresh off
+    the current quote, not off the historical Status column, because
+    Status ("Open" in particular) reflects a contract that triggered on
+    ANY day within the whole look-back window and stays "Open" even if
+    price has since fallen back below Entry.
+
+    Requiring an actual prev-below / now-above edge (via
+    load_last_ltp_state / save_last_ltp_state) — rather than simply
+    "LTP >= Entry right now" — avoids a stale-looking alert firing the
+    moment Telegram gets enabled, the app restarts, or "Reset Alerts" is
+    clicked while price is already sitting well past Entry (e.g. an
+    Away % of 127% or 192%, far beyond the 100% mark that means "just
+    crossed"). On the first observation of a symbol in a session/day
+    there is no prior LTP to compare against, so that refresh only seeds
+    the baseline and never fires an alert by itself — the earliest a
+    symbol can alert is the refresh after one where it was seen below
+    Entry.
+
     Still de-duplicated per calendar day via the persisted alert-state
     file (tagged "ATL:<symbol>", reset automatically each trading day)
-    so a symbol that stays above Entry for hours only sends ONE Telegram
-    message that day, not one every refresh.
+    on top of the crossover check, so a symbol that re-alerts logic
+    doesn't fire twice for the same crossing across retries.
     """
     if not telegram_enabled:
         return
     if df.empty:
         return
     alerted = load_trigger_alert_state()
+    last_ltp = load_last_ltp_state()
     newly_triggered = []
+    ltp_state_changed = False
     for _, row in df.iterrows():
         symbol = row.get("Symbol")
         if not symbol:
             continue
         ltp, entry = row.get("LTP"), row.get("Entry")
-        if pd.isna(ltp) or pd.isna(entry) or ltp < entry:
-            continue  # LTP hasn't actually crossed Entry (yet, or anymore)
+        if pd.isna(ltp) or pd.isna(entry):
+            continue
+        prev_ltp = last_ltp.get(symbol)
+        if prev_ltp != ltp:
+            last_ltp[symbol] = ltp
+            ltp_state_changed = True
+        if prev_ltp is None or prev_ltp >= entry:
+            continue  # no prior below-Entry baseline to cross FROM this refresh
+        if ltp < entry:
+            continue  # hasn't crossed yet
         alert_id = f"ATL:{symbol}"
         if alert_id not in alerted:
             newly_triggered.append((alert_id, row))
+    if ltp_state_changed:
+        save_last_ltp_state(last_ltp)
     if not newly_triggered:
         return
     sent_count = 0
@@ -1020,7 +1089,8 @@ else:
         reset_alert_state_clicked = tg_col2.button("Reset Alerts", width="stretch")
         if reset_alert_state_clicked:
             save_trigger_alert_state(set())
-            st.success("Alert state cleared — already-triggered options will alert again.")
+            save_last_ltp_state({})
+            st.success("Alert state cleared — options will alert again on their next fresh Entry crossover (not instantly, even if already above Entry).")
         if test_telegram_clicked:
             success, error = send_telegram_alert(
                 telegram_bot_token,
