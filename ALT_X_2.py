@@ -739,24 +739,25 @@ def check_and_alert_atl(df, telegram_enabled, bot_token, chat_id):
 # BHAVCOPY-BASED STRIKE-SELECTION REFERENCE PRICE
 #
 # nearest_option() needs one reference price per underlying to pick the
-# nearest CE/PE strike. That used to come ONLY from the futures
-# contract's live MONTHLY OPEN (fetch_monthly_open_map, above) — an
-# extra heavy Upstox historical-candle pass per future.
+# nearest CE/PE strike. This is now sourced ENTIRELY from an uploaded
+# NSE F&O Bhavcopy — there is no live Upstox futures-open fetch and no
+# monthly-open fallback any more. Without a Bhavcopy uploaded, the
+# scanner refuses to run (build_atl_scanner errors out and returns
+# empty tables) rather than falling back to a live-computed price.
 #
-# Uploading an NSE F&O Bhavcopy in the sidebar (the daily UDiFF
-# "BhavCopy_NSE_FO_0_0_0_<date>_F_0000.csv" report — also accepted as
-# .csv.gz or the .zip NSE distributes it in) instead sources that
-# reference price straight from the exchange's own end-of-day report:
-# its per-row "UndrlygPric" column (NSE's published underlying closing
-# price for that contract) is grouped by symbol into one price per
-# underlying. Older Bhavcopy layouts that don't publish UndrlygPric
-# fall back to the FUT row's own closing price (INSTRUMENT/ClsPric).
+# Upload the daily UDiFF "BhavCopy_NSE_FO_0_0_0_<date>_F_0000.csv"
+# report in the sidebar (also accepted as .csv.gz, or the .zip NSE
+# distributes it in). Its per-row "UndrlygPric" column (NSE's own
+# published underlying closing price for that contract) is grouped by
+# symbol into one price per underlying. Older Bhavcopy layouts that
+# don't publish UndrlygPric fall back to the FUT row's own closing
+# price (INSTRUMENT/ClsPric) instead — that's the only fallback left.
 #
 # This is looked up by underlying SYMBOL (e.g. "RELIANCE"), not by
 # Upstox instrument_key, since that's what a Bhavcopy row identifies.
-# Any underlying not found in the uploaded file — or when nothing is
-# uploaded at all — falls back to the live monthly-open method per
-# symbol, so the scanner keeps working without a Bhavcopy.
+# Any underlying not found in the uploaded file is simply dropped from
+# the scan (reported in an expander in build_atl_scanner) rather than
+# substituted with a live price.
 # ============================================================
 def parse_bhavcopy_underlying_prices(uploaded_file):
     """
@@ -805,6 +806,37 @@ def parse_bhavcopy_underlying_prices(uploaded_file):
     if not price_map:
         return {}, "Bhavcopy parsed but no usable prices were found in it."
     return price_map, None
+def render_bhavcopy_uploader(container):
+    """
+    Renders the Bhavcopy uploader + status message in the given
+    Streamlit container (st.sidebar in the normal view, or st itself in
+    client view where the sidebar is hidden via CSS), and returns the
+    parsed {symbol: price} map. Bhavcopy is now the ONLY source of the
+    strike-selection reference price — there is no live-price fallback
+    — so this upload is required before the scanner will run.
+    """
+    container.markdown("**Bhavcopy (Strike Reference) — required**")
+    bhavcopy_file = container.file_uploader(
+        "Upload NSE F&O Bhavcopy",
+        type=["csv", "gz", "zip"],
+        help=(
+            "REQUIRED. Strike selection (which CE/PE strike counts as "
+            "'nearest') is read entirely from this file's 'UndrlygPric' "
+            "column per symbol (falling back to the FUT row's close "
+            "price on older layouts) — there is no live-price fallback "
+            "any more. The scanner won't run without one uploaded."
+        ),
+        key="bhavcopy_uploader",
+    )
+    price_map, error = parse_bhavcopy_underlying_prices(bhavcopy_file)
+    if bhavcopy_file is not None:
+        if error:
+            container.error(f"Bhavcopy: {error}")
+        else:
+            container.success(f"Bhavcopy loaded — {len(price_map)} underlying symbols.")
+    else:
+        container.warning("No Bhavcopy uploaded yet — required for strike selection.")
+    return price_map
 def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_map=None):
     headers = {
         "Accept": "application/json",
@@ -985,7 +1017,11 @@ if is_client_view:
     telegram_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
     telegram_enabled = bool(telegram_bot_token and telegram_chat_id)
-    bhavcopy_price_map = {}  # sidebar (and its uploader) is hidden in client view
+    # The sidebar (and its config) is hidden in client view, but the
+    # Bhavcopy upload is required and has no live-price fallback, so it
+    # gets rendered in the main body instead, above the title.
+    bhavcopy_price_map = render_bhavcopy_uploader(st)
+    st.markdown("---")
 else:
     with st.sidebar:
         st.header("Configuration")
