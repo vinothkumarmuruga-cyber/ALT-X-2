@@ -369,53 +369,13 @@ def chunk_list(items, size=300):
     items = list(items)
     for i in range(0, len(items), size):
         yield items[i:i + size]
-def fetch_future_open_v3(instrument_keys, headers):
-    url = "https://api.upstox.com/v3/market-quote/ohlc"
-    rows = []
-    raw_sample = None
-    for keys in chunk_list(instrument_keys):
-        params = {"instrument_key": ",".join(keys), "interval": "1d"}
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=20)
-        except Exception as e:
-            st.warning(f"OHLC request error: {e}")
-            continue
-        if response.status_code != 200:
-            st.warning(f"OHLC Error {response.status_code}: {response.text[:300]}")
-            continue
-        try:
-            payload = response.json()
-            data = payload.get("data", {})
-        except Exception as e:
-            st.warning(f"Invalid OHLC response: {e}")
-            continue
-        if raw_sample is None:
-            raw_sample = dict(list(data.items())[:2])
-        for response_key, item in data.items():
-            if not isinstance(item, dict):
-                continue
-            live = item.get("live_ohlc") or item.get("ohlc") or {}
-            prev = item.get("prev_ohlc") or {}
-            true_key = item.get("instrument_token") or response_key
-            open_price = (
-                live.get("open")
-                if live.get("open") not in (None, 0)
-                else prev.get("close") if prev.get("close") not in (None, 0)
-                else item.get("last_price")
-            )
-            rows.append({
-                "instrument_key": true_key,
-                "future_open": open_price,
-                "future_ltp": item.get("last_price"),
-            })
-    return pd.DataFrame(rows), raw_sample
 def nearest_option(options_df, underlying_key, expiry, option_type, ref_price):
     """
     ref_price is the reference price the "nearest strike" is measured
-    against — this used to be the future's TODAY open (changed every day,
-    so the ATM CE/PE picked also changed every day). It is now the
-    future's MONTHLY open (see fetch_monthly_open_map below) so the
-    selected CE/PE strike stays fixed for the whole calendar month.
+    against — sourced entirely from the uploaded NSE F&O Bhavcopy (see
+    parse_bhavcopy_underlying_prices below), so the selected CE/PE
+    strike is whatever the exchange's own end-of-day underlying price
+    says is nearest, not a live-computed open.
     """
     chain = options_df[
         (options_df["underlying_key"] == underlying_key) &
@@ -426,66 +386,6 @@ def nearest_option(options_df, underlying_key, expiry, option_type, ref_price):
         return None
     chain["strike_diff"] = (chain["strike_price"] - ref_price).abs()
     return chain.sort_values("strike_diff").iloc[0]
-# ============================================================
-# MONTHLY OPEN (strike-selection reference price)
-#
-# Strike selection (nearest_option, above) used to be re-anchored every
-# day to that day's futures open, so the ATM CE/PE tracked could change
-# daily. This instead locks the reference price to the future's open on
-# the FIRST TRADING DAY OF THE CURRENT CALENDAR MONTH, so the same CE/PE
-# strike is tracked all month.
-#
-# fetch_monthly_open_single reuses fetch_atl_history (already defined
-# above, further down the file) to pull daily candles for the future
-# from the 1st of the month up to a "probe window" end date, and takes
-# the OPEN of the earliest candle in that range — i.e. the open of
-# whichever day the month's trading actually started on (handles
-# month-start weekends/holidays correctly).
-#
-# The probe window end is capped at month_start + 10 days once we're
-# far enough into the month, instead of always using "yesterday" — this
-# keeps the (month_start, probe_end) cache key STABLE for the rest of
-# the month, so this heavy historical pass runs once a month per future
-# instead of being re-fetched every single day.
-#
-# On the month's very first trading day itself there is no completed
-# daily candle yet at all (historical endpoints don't return today's
-# still-forming candle) — build_atl_scanner falls back to today's live
-# open (from fetch_future_open_v3) for that one day only; every day
-# after that, the real monthly-open candle is picked up and the
-# reference price stays fixed.
-# ============================================================
-MONTHLY_OPEN_PROBE_DAYS = 10
-def fetch_monthly_open_single(instrument_key, headers, month_start, probe_end, max_retries=2):
-    candles = fetch_atl_history(instrument_key, headers, month_start, probe_end, max_retries)
-    if candles is None or candles.empty:
-        return instrument_key, None
-    first_open = candles.iloc[0]["open"]
-    if first_open in (None, 0) or pd.isna(first_open):
-        return instrument_key, None
-    return instrument_key, float(first_open)
-@st.cache_data(ttl=None, show_spinner="Fetching monthly open prices...")
-def fetch_monthly_open_map(instrument_keys, headers_tuple, month_start_iso, probe_end_iso):
-    headers = dict(headers_tuple)
-    month_start = datetime.strptime(month_start_iso, "%Y-%m-%d").date()
-    probe_end = datetime.strptime(probe_end_iso, "%Y-%m-%d").date()
-    result = {}
-    instrument_keys = list(instrument_keys)
-    batch_size = 10
-    pause_between_batches = 0.6
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        for i in range(0, len(instrument_keys), batch_size):
-            batch = instrument_keys[i:i + batch_size]
-            futures_map = {
-                executor.submit(fetch_monthly_open_single, key, headers, month_start, probe_end): key
-                for key in batch
-            }
-            for future in as_completed(futures_map):
-                key, open_price = future.result()
-                result[key] = open_price
-            if i + batch_size < len(instrument_keys):
-                time.sleep(pause_between_batches)
-    return result
 def table_height(df, row_px=35, header_px=38, max_px=900):
     return min(header_px + row_px * max(len(df), 1) + 3, max_px)
 def style_away_percent(value):
@@ -684,9 +584,8 @@ def fetch_today_live_ohlc(instrument_keys, headers):
     """
     Today's still-forming daily candle (running high/low) plus LTP, for
     the live overlay on top of the cached historical ATL pass. One
-    batched call across all instruments — same v3 OHLC endpoint used by
-    fetch_future_open_v3, just extracting high/low/last_price instead of
-    just open.
+    batched call across all instruments via Upstox's v3 OHLC endpoint,
+    extracting high/low/last_price.
     """
     url = "https://api.upstox.com/v3/market-quote/ohlc"
     rows = []
@@ -919,52 +818,22 @@ def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_ma
     futures = futures[futures["expiry_date"] == expiry].copy()
     options = options[options["expiry_date"] == expiry].copy()
     bhavcopy_price_map = bhavcopy_price_map or {}
-    fut_quotes, _ = fetch_future_open_v3(futures["instrument_key"].tolist(), headers)
-    if fut_quotes.empty:
-        st.error("No futures open data received")
+    if not bhavcopy_price_map:
+        st.error("Upload an NSE F&O Bhavcopy in the sidebar first — strike selection now reads its reference price from the Bhavcopy only.")
         return pd.DataFrame(), pd.DataFrame()
-    # Strike selection reference price, in priority order:
-    #   1) the uploaded Bhavcopy's per-symbol UndrlygPric (see the
-    #      "BHAVCOPY-BASED STRIKE-SELECTION REFERENCE PRICE" section
-    #      above) — the exchange's own end-of-day underlying price;
-    #   2) the futures contract's MONTHLY open (fixed for the whole
-    #      calendar month — see the "MONTHLY OPEN" section above) for
-    #      any symbol the Bhavcopy doesn't cover;
-    #   3) today's live open (fut_quotes, already fetched above), only
-    #      on the month's very first trading day when no completed
-    #      monthly-open candle exists yet.
-    # The heavy monthly-open fetch only runs for symbols NOT already
-    # covered by the Bhavcopy, so uploading a full day's Bhavcopy skips
-    # it entirely.
-    today_ist = get_ist_now().date()
-    month_start = today_ist.replace(day=1)
-    probe_end = min(month_start + timedelta(days=MONTHLY_OPEN_PROBE_DAYS), today_ist - timedelta(days=1))
-    needs_monthly_open = futures[~futures["underlying_symbol"].isin(bhavcopy_price_map.keys())]
-    if not needs_monthly_open.empty and probe_end >= month_start:
-        monthly_open_map = fetch_monthly_open_map(
-            tuple(sorted(needs_monthly_open["instrument_key"].unique())),
-            tuple(headers.items()),
-            month_start.isoformat(),
-            probe_end.isoformat(),
-        )
-    else:
-        monthly_open_map = {}  # fully covered by Bhavcopy, or today IS the month's first trading day
-    today_open_map = dict(zip(fut_quotes["instrument_key"], fut_quotes["future_open"]))
-    def _resolve_monthly_open(key):
-        val = monthly_open_map.get(key)
-        if val is None or pd.isna(val):
-            return today_open_map.get(key)  # month's first trading day fallback
-        return val
-    def _resolve_reference_price(fut_row):
-        bhav_price = bhavcopy_price_map.get(fut_row["underlying_symbol"])
-        if bhav_price is not None and not pd.isna(bhav_price):
-            return bhav_price
-        return _resolve_monthly_open(fut_row["instrument_key"])
-    futures["future_open"] = futures.apply(_resolve_reference_price, axis=1)
+    # Strike selection reference price comes ONLY from the uploaded
+    # Bhavcopy's per-symbol price (see parse_bhavcopy_underlying_prices
+    # above) — no live futures-open fetch, no monthly-open fallback. Any
+    # underlying not present in the uploaded file is simply dropped.
+    futures["future_open"] = futures["underlying_symbol"].map(bhavcopy_price_map)
+    dropped = futures[futures["future_open"].isna()]["underlying_symbol"].unique().tolist()
     futures = futures.dropna(subset=["future_open"])
     if futures.empty:
-        st.error("All futures were dropped — no Bhavcopy price and no Monthly-Open fallback available.")
+        st.error("None of this expiry's underlyings were found in the uploaded Bhavcopy.")
         return pd.DataFrame(), pd.DataFrame()
+    if dropped:
+        with st.expander(f"⚠️ {len(dropped)} underlying(s) skipped — not found in the uploaded Bhavcopy"):
+            st.write(", ".join(sorted(dropped)))
     selected_rows = []
     for _, fut in futures.iterrows():
         ce = nearest_option(options, fut["underlying_key"], expiry, "CE", fut["future_open"])
