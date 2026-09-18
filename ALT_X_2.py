@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import requests
 import os
+import io
+import zipfile
 import time
 import json
 from datetime import date, datetime, timedelta, timezone
@@ -834,7 +836,77 @@ def check_and_alert_atl(df, telegram_enabled, bot_token, chat_id):
         st.toast(f"Telegram alert sent for {sent_count} ATL entry trigger(s).", icon="🚀")
     if fail_count:
         st.toast(f"{fail_count} ATL alert(s) failed — will retry next refresh.", icon="⚠️")
-def build_atl_scanner(access_token, expiry_choice, start_date):
+# ============================================================
+# BHAVCOPY-BASED STRIKE-SELECTION REFERENCE PRICE
+#
+# nearest_option() needs one reference price per underlying to pick the
+# nearest CE/PE strike. That used to come ONLY from the futures
+# contract's live MONTHLY OPEN (fetch_monthly_open_map, above) — an
+# extra heavy Upstox historical-candle pass per future.
+#
+# Uploading an NSE F&O Bhavcopy in the sidebar (the daily UDiFF
+# "BhavCopy_NSE_FO_0_0_0_<date>_F_0000.csv" report — also accepted as
+# .csv.gz or the .zip NSE distributes it in) instead sources that
+# reference price straight from the exchange's own end-of-day report:
+# its per-row "UndrlygPric" column (NSE's published underlying closing
+# price for that contract) is grouped by symbol into one price per
+# underlying. Older Bhavcopy layouts that don't publish UndrlygPric
+# fall back to the FUT row's own closing price (INSTRUMENT/ClsPric).
+#
+# This is looked up by underlying SYMBOL (e.g. "RELIANCE"), not by
+# Upstox instrument_key, since that's what a Bhavcopy row identifies.
+# Any underlying not found in the uploaded file — or when nothing is
+# uploaded at all — falls back to the live monthly-open method per
+# symbol, so the scanner keeps working without a Bhavcopy.
+# ============================================================
+def parse_bhavcopy_underlying_prices(uploaded_file):
+    """
+    Returns (price_map, error): price_map is {symbol: price} built from
+    the uploaded NSE F&O Bhavcopy file. error is None on success, or a
+    short message to show the user if the file couldn't be parsed.
+    Returns ({}, None) if uploaded_file is None (nothing uploaded yet).
+    """
+    if uploaded_file is None:
+        return {}, None
+    name = uploaded_file.name.lower()
+    try:
+        raw_bytes = uploaded_file.getvalue()
+        if name.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+                csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                if not csv_names:
+                    return {}, "No CSV found inside the uploaded zip."
+                with zf.open(csv_names[0]) as f:
+                    df = pd.read_csv(f)
+        elif name.endswith(".gz"):
+            df = pd.read_csv(io.BytesIO(raw_bytes), compression="gzip")
+        else:
+            df = pd.read_csv(io.BytesIO(raw_bytes))
+    except Exception as e:
+        return {}, f"Could not read Bhavcopy file: {e}"
+    df.columns = [str(c).strip() for c in df.columns]
+    symbol_col = next((c for c in ["TckrSymb", "SYMBOL", "Symbol"] if c in df.columns), None)
+    if symbol_col is None:
+        return {}, "Bhavcopy is missing a symbol column (expected TckrSymb / SYMBOL)."
+    price_col = next((c for c in ["UndrlygPric", "UNDRLYPRC", "UnderlyingPrice"] if c in df.columns), None)
+    if price_col is not None:
+        work_df = df
+    else:
+        # Older layouts don't publish UndrlygPric — fall back to the
+        # futures row's own closing price for that underlying.
+        instr_col = next((c for c in ["FinInstrmTp", "INSTRUMENT"] if c in df.columns), None)
+        close_col = next((c for c in ["ClsPric", "CLOSE"] if c in df.columns), None)
+        if instr_col is None or close_col is None:
+            return {}, "Bhavcopy has neither UndrlygPric nor a recognizable FUT close column."
+        work_df = df[df[instr_col].astype(str).str.contains("F", case=False, na=False)]
+        price_col = close_col
+    work_df = work_df.copy()
+    work_df[price_col] = pd.to_numeric(work_df[price_col], errors="coerce")
+    price_map = work_df.dropna(subset=[price_col]).groupby(symbol_col)[price_col].first().to_dict()
+    if not price_map:
+        return {}, "Bhavcopy parsed but no usable prices were found in it."
+    return price_map, None
+def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_map=None):
     headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {access_token}"
@@ -846,37 +918,52 @@ def build_atl_scanner(access_token, expiry_choice, start_date):
         return pd.DataFrame(), pd.DataFrame()
     futures = futures[futures["expiry_date"] == expiry].copy()
     options = options[options["expiry_date"] == expiry].copy()
+    bhavcopy_price_map = bhavcopy_price_map or {}
     fut_quotes, _ = fetch_future_open_v3(futures["instrument_key"].tolist(), headers)
     if fut_quotes.empty:
         st.error("No futures open data received")
         return pd.DataFrame(), pd.DataFrame()
-    # Strike selection reference price = MONTHLY open (fixed for the whole
-    # calendar month), not today's open — see the "MONTHLY OPEN" section
-    # above for why. today's live open (fut_quotes, already fetched above)
-    # is used only as a fallback on the month's very first trading day,
-    # when no completed monthly-open candle exists yet.
+    # Strike selection reference price, in priority order:
+    #   1) the uploaded Bhavcopy's per-symbol UndrlygPric (see the
+    #      "BHAVCOPY-BASED STRIKE-SELECTION REFERENCE PRICE" section
+    #      above) — the exchange's own end-of-day underlying price;
+    #   2) the futures contract's MONTHLY open (fixed for the whole
+    #      calendar month — see the "MONTHLY OPEN" section above) for
+    #      any symbol the Bhavcopy doesn't cover;
+    #   3) today's live open (fut_quotes, already fetched above), only
+    #      on the month's very first trading day when no completed
+    #      monthly-open candle exists yet.
+    # The heavy monthly-open fetch only runs for symbols NOT already
+    # covered by the Bhavcopy, so uploading a full day's Bhavcopy skips
+    # it entirely.
     today_ist = get_ist_now().date()
     month_start = today_ist.replace(day=1)
     probe_end = min(month_start + timedelta(days=MONTHLY_OPEN_PROBE_DAYS), today_ist - timedelta(days=1))
-    if probe_end >= month_start:
+    needs_monthly_open = futures[~futures["underlying_symbol"].isin(bhavcopy_price_map.keys())]
+    if not needs_monthly_open.empty and probe_end >= month_start:
         monthly_open_map = fetch_monthly_open_map(
-            tuple(sorted(futures["instrument_key"].unique())),
+            tuple(sorted(needs_monthly_open["instrument_key"].unique())),
             tuple(headers.items()),
             month_start.isoformat(),
             probe_end.isoformat(),
         )
     else:
-        monthly_open_map = {}  # today IS the month's first trading day — nothing to probe yet
+        monthly_open_map = {}  # fully covered by Bhavcopy, or today IS the month's first trading day
     today_open_map = dict(zip(fut_quotes["instrument_key"], fut_quotes["future_open"]))
     def _resolve_monthly_open(key):
         val = monthly_open_map.get(key)
         if val is None or pd.isna(val):
             return today_open_map.get(key)  # month's first trading day fallback
         return val
-    futures["future_open"] = futures["instrument_key"].apply(_resolve_monthly_open)
+    def _resolve_reference_price(fut_row):
+        bhav_price = bhavcopy_price_map.get(fut_row["underlying_symbol"])
+        if bhav_price is not None and not pd.isna(bhav_price):
+            return bhav_price
+        return _resolve_monthly_open(fut_row["instrument_key"])
+    futures["future_open"] = futures.apply(_resolve_reference_price, axis=1)
     futures = futures.dropna(subset=["future_open"])
     if futures.empty:
-        st.error("All futures were dropped after the Monthly-Open fetch.")
+        st.error("All futures were dropped — no Bhavcopy price and no Monthly-Open fallback available.")
         return pd.DataFrame(), pd.DataFrame()
     selected_rows = []
     for _, fut in futures.iterrows():
@@ -1029,6 +1116,7 @@ if is_client_view:
     telegram_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
     telegram_enabled = bool(telegram_bot_token and telegram_chat_id)
+    bhavcopy_price_map = {}  # sidebar (and its uploader) is hidden in client view
 else:
     with st.sidebar:
         st.header("Configuration")
@@ -1048,6 +1136,27 @@ else:
             index=0,
             help="Which monthly expiry's ATM options the scanner tracks."
         )
+        st.markdown("---")
+        st.header("Bhavcopy (Strike Reference)")
+        bhavcopy_file = st.file_uploader(
+            "Upload NSE F&O Bhavcopy",
+            type=["csv", "gz", "zip"],
+            help=(
+                "Used as the strike-selection reference price (which CE/PE "
+                "strike counts as 'nearest') instead of Upstox's live "
+                "monthly futures open. Reads the Bhavcopy's 'UndrlygPric' "
+                "column per symbol when present, falling back to the FUT "
+                "row's close price on older layouts. Any symbol not found "
+                "in the uploaded file falls back to the live monthly-open "
+                "method automatically, so this is optional."
+            )
+        )
+        bhavcopy_price_map, bhavcopy_error = parse_bhavcopy_underlying_prices(bhavcopy_file)
+        if bhavcopy_file is not None:
+            if bhavcopy_error:
+                st.error(f"Bhavcopy: {bhavcopy_error}")
+            else:
+                st.success(f"Bhavcopy loaded — {len(bhavcopy_price_map)} underlying symbols.")
         st.markdown("---")
         st.header("ATL x2 Scanner Settings")
         atl_start_date = st.date_input(
@@ -1120,7 +1229,7 @@ else:
     @st.fragment(run_every=run_every)
     def show_atl():
         ce_table, pe_table = build_atl_scanner(
-            access_token, expiry_type, atl_start_date
+            access_token, expiry_type, atl_start_date, bhavcopy_price_map
         )
         if not ce_table.empty or not pe_table.empty:
             if telegram_enabled:
