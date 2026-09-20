@@ -494,8 +494,9 @@ def _parse_bhavcopy_bytes(name, raw_bytes):
     """
     Returns (price_map, low_map, bhav_date, error).
       price_map: {symbol: underlying price}  -> strike selection
-      low_map:   {(symbol, expiry_date, strike, "CE"/"PE"): LOW price}
-                 -> Entry = LOW x 2
+      low_map:   {(symbol, expiry_date, strike, "CE"/"PE"): (LOW, HIGH)}
+                 -> Entry = LOW x 2; HIGH is used to reject contracts
+                 whose Entry was already touched on the Bhavcopy day
       bhav_date: trade date string found in the file (or None)
     """
     name = name.lower()
@@ -535,16 +536,18 @@ def _parse_bhavcopy_bytes(name, raw_bytes):
         return {}, {}, None, "Bhavcopy parsed but no usable prices were found in it."
     # ---------- per-option LOW price ----------
     low_col = next((c for c in ["LwPric", "LOW", "LowPric", "Low"] if c in df.columns), None)
+    high_col = next((c for c in ["HghPric", "HIGH", "HighPric", "High"] if c in df.columns), None)
     opt_col = next((c for c in ["OptnTp", "OPTION_TYP"] if c in df.columns), None)
     strike_col = next((c for c in ["StrkPric", "STRIKE_PR"] if c in df.columns), None)
     exp_col = next((c for c in ["XpryDt", "EXPIRY_DT", "FininstrmActlXpryDt"] if c in df.columns), None)
-    if None in (low_col, opt_col, strike_col, exp_col):
+    if None in (low_col, high_col, opt_col, strike_col, exp_col):
         return {}, {}, None, (
-            "Bhavcopy is missing option Low columns "
-            "(need LwPric/LOW + OptnTp + StrkPric + XpryDt)."
+            "Bhavcopy is missing option Low/High columns "
+            "(need LwPric/LOW + HghPric/HIGH + OptnTp + StrkPric + XpryDt)."
         )
     opts = df[df[opt_col].astype(str).str.strip().str.upper().isin(["CE", "PE"])].copy()
     opts["_low"] = pd.to_numeric(opts[low_col], errors="coerce")
+    opts["_high"] = pd.to_numeric(opts[high_col], errors="coerce")
     opts["_strike"] = pd.to_numeric(opts[strike_col], errors="coerce").round(2)
     opts["_exp"] = _parse_expiry_series(opts[exp_col])
     opts["_sym"] = opts[symbol_col].astype(str).str.strip()
@@ -553,9 +556,9 @@ def _parse_bhavcopy_bytes(name, raw_bytes):
     if opts.empty:
         return {}, {}, None, "Bhavcopy parsed but no option Low prices were found in it."
     low_map = {
-        (sym, exp, float(strike), ot): float(low)
-        for sym, exp, strike, ot, low in zip(
-            opts["_sym"], opts["_exp"], opts["_strike"], opts["_ot"], opts["_low"]
+        (sym, exp, float(strike), ot): (float(low), float(high) if pd.notna(high) else float("nan"))
+        for sym, exp, strike, ot, low, high in zip(
+            opts["_sym"], opts["_exp"], opts["_strike"], opts["_ot"], opts["_low"], opts["_high"]
         )
     }
     # ---------- trade date (display only) ----------
@@ -850,9 +853,12 @@ def build_scanner(access_token, expiry_choice, bhavcopy_price_map, bhavcopy_low_
             selected["underlying_symbol"], selected["strike"], selected["option_type"]
         )
     ]
+    _lh = [bhavcopy_low_map.get(k, (None, None)) for k in low_keys]
     selected["PDL"] = pd.to_numeric(
-        pd.Series([bhavcopy_low_map.get(k) for k in low_keys], index=selected.index),
-        errors="coerce"
+        pd.Series([x[0] for x in _lh], index=selected.index), errors="coerce"
+    )
+    selected["PDL High"] = pd.to_numeric(
+        pd.Series([x[1] for x in _lh], index=selected.index), errors="coerce"
     )
     missing_count = int(selected["PDL"].isna().sum())
     total_count = len(selected)
@@ -873,6 +879,17 @@ def build_scanner(access_token, expiry_choice, bhavcopy_price_map, bhavcopy_low_
     selected["Entry"] = selected["PDL"] * ENTRY_MULT
     selected["TGT"] = selected["Entry"] * EXIT_MULT
     selected["SL"] = selected["Entry"] * SL_MULT
+    # Not our setup: Entry (PDL x2) was already touched on the PDL day
+    # itself (that day's HIGH >= Entry). Only contracts whose Entry is
+    # first reached AFTER the PDL day qualify, so drop these before the
+    # live quote call.
+    same_day = selected["PDL High"] >= selected["Entry"]
+    if same_day.any():
+        with st.expander(f"ℹ️ {int(same_day.sum())} option(s) skipped — Entry already hit on the PDL day itself"):
+            st.write(", ".join(selected.loc[same_day, "Symbol"].tolist()[:50]))
+    selected = selected[~same_day].reset_index(drop=True)
+    if selected.empty:
+        return pd.DataFrame(), pd.DataFrame()
     live_ohlc = fetch_today_live_ohlc(selected["option_key"].tolist(), headers)
     selected = selected.merge(live_ohlc, left_on="option_key", right_on="instrument_key", how="left")
     selected["Status"] = resolve_statuses(selected, headers)
