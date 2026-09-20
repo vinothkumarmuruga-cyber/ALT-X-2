@@ -352,7 +352,14 @@ def load_live_fo_instruments():
         (instruments["instrument_type"].isin(["CE", "PE"])) &
         (instruments["underlying_type"] == "EQUITY")
     ].copy()
-    return futures, options
+    # Underlying stock instrument_key ("NSE_EQ|INE...") -> exchange_token,
+    # used to build the Upstox stock-chart link (see upstox_chart_url).
+    equities = instruments[instruments["segment"] == "NSE_EQ"]
+    eq_tokens = dict(zip(
+        equities["instrument_key"].astype(str),
+        equities["exchange_token"].astype(str)
+    ))
+    return futures, options, eq_tokens
 def get_expiry_for_choice(df, choice):
     today = date.today()
     valid = sorted(df[df["expiry_date"] >= today]["expiry_date"].unique())
@@ -405,27 +412,26 @@ def apply_column_tints(styler, tints):
 # ============================================================
 # UPSTOX CHART DEEP-LINK
 #
-# Clicking a strike in the tables opens that option's chart on Upstox Pro
-# Web in a new tab. Upstox's chart URL identifies a contract by segment
-# ("exchange") + "chartToken", and the chartToken is the instrument's
-# exchange_token — which is exactly the part after the "|" in the
-# instrument_key we already have (e.g. "NSE_FO|54321" -> exchange=NSE_FO,
-# chartToken=54321). No extra lookup needed.
+# Clicking a row in the tables opens the UNDERLYING STOCK's chart (not the
+# option strike) on Upstox Pro Web in a new tab. Upstox's chart URL
+# identifies an instrument by segment ("exchange") + "chartToken", and the
+# chartToken is the instrument's exchange_token from the Upstox instrument
+# file. For a stock that is the NSE_EQ row matching the option's
+# underlying_key (see load_live_fo_instruments -> eq_tokens).
 #
 # If Upstox ever changes the chart URL format, edit ONLY
 # UPSTOX_CHART_URL_TEMPLATE below — everything else keys off it.
 # ============================================================
 UPSTOX_CHART_URL_TEMPLATE = "https://pro.upstox.com/trading-charts?exchange={exchange}&chartToken={token}"
-def upstox_chart_url(instrument_key, symbol):
+def upstox_chart_url(exchange, token, symbol):
     """
-    Chart URL for one option contract. The human-readable symbol is
-    appended as a trailing "&sym=..." param purely so the table's
-    LinkColumn can display it (via a display_text regex) while the
-    whole cell stays a clickable link — Upstox ignores the extra param.
+    Chart URL for one instrument. The human-readable symbol is appended
+    as a trailing "&sym=..." param purely so the table's LinkColumn can
+    display it (via a display_text regex) while the whole cell stays a
+    clickable link — Upstox ignores the extra param. Returns None if the
+    token is unknown (cell then just shows empty).
     """
-    try:
-        exchange, token = str(instrument_key).split("|", 1)
-    except ValueError:
+    if not token or str(token).lower() in ("nan", "none"):
         return None
     base = UPSTOX_CHART_URL_TEMPLATE.format(exchange=exchange, token=token)
     return f"{base}&sym={symbol}"
@@ -869,7 +875,7 @@ def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_ma
         "Accept": "application/json",
         "Authorization": f"Bearer {access_token}"
     }
-    futures, options = load_live_fo_instruments()
+    futures, options, eq_tokens = load_live_fo_instruments()
     expiry = get_expiry_for_choice(futures, expiry_choice)
     if expiry is None:
         st.error("No futures expiry found")
@@ -902,6 +908,7 @@ def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_ma
                 continue
             selected_rows.append({
                 "underlying_symbol": fut["underlying_symbol"],
+                "underlying_key": fut["underlying_key"],
                 "strike": opt["strike_price"],
                 "option_type": opt["instrument_type"],
                 "option_key": opt["instrument_key"],
@@ -956,11 +963,12 @@ def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_ma
     )
     selected["Away %"] = selected["Away %"].clip(lower=0)
     selected["Cap"] = selected["LTP"] * selected["Lot"]
-    # Clickable link (opens this strike's chart on Upstox Pro Web) — shown
-    # in place of the plain Symbol column, see DISPLAY_COLS_ATL /
+    # Clickable link (opens the underlying STOCK's chart on Upstox Pro Web)
+    # — shown in place of the plain Symbol column, see DISPLAY_COLS_ATL /
     # ATL_COLUMN_CONFIG below.
     selected["Chart"] = selected.apply(
-        lambda r: upstox_chart_url(r["option_key"], r["Symbol"]), axis=1
+        lambda r: upstox_chart_url("NSE_EQ", eq_tokens.get(str(r["underlying_key"])), r["Symbol"]),
+        axis=1
     )
     # TGT, SL, Lot, Cap are kept in `result` even though they are no
     # longer shown in the table (DISPLAY_COLS_ATL below) — they're still
@@ -998,7 +1006,7 @@ DECIMAL_COLS_ATL = {
 # TGT, SL, Lot and Cap are likewise kept out of the displayed table (they
 # still exist on the underlying DataFrame for the Telegram alert / log).
 #
-# "Chart" is the clickable strike: it holds the Upstox chart URL, and the
+# "Chart" is the clickable symbol: it holds the Upstox chart URL, and the
 # LinkColumn below relabels it "Symbol" and displays just the contract
 # name (regex grabs everything after "sym=" at the end of the URL) — so
 # it looks like the normal Symbol column but opens the chart on click.
@@ -1007,7 +1015,7 @@ ATL_COLUMN_CONFIG = {
     "Chart": st.column_config.LinkColumn(
         "Symbol",
         display_text=r"sym=(.*)$",
-        help="Click a strike to open its chart on Upstox Pro Web.",
+        help="Click to open the underlying stock's chart on Upstox Pro Web.",
     ),
 }
 CE_ATL_TINTS = {
