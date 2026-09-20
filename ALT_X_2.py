@@ -403,6 +403,33 @@ def apply_column_tints(styler, tints):
         styler = styler.set_properties(subset=[col], **css)
     return styler
 # ============================================================
+# UPSTOX CHART DEEP-LINK
+#
+# Clicking a strike in the tables opens that option's chart on Upstox Pro
+# Web in a new tab. Upstox's chart URL identifies a contract by segment
+# ("exchange") + "chartToken", and the chartToken is the instrument's
+# exchange_token — which is exactly the part after the "|" in the
+# instrument_key we already have (e.g. "NSE_FO|54321" -> exchange=NSE_FO,
+# chartToken=54321). No extra lookup needed.
+#
+# If Upstox ever changes the chart URL format, edit ONLY
+# UPSTOX_CHART_URL_TEMPLATE below — everything else keys off it.
+# ============================================================
+UPSTOX_CHART_URL_TEMPLATE = "https://pro.upstox.com/trading-charts?exchange={exchange}&chartToken={token}"
+def upstox_chart_url(instrument_key, symbol):
+    """
+    Chart URL for one option contract. The human-readable symbol is
+    appended as a trailing "&sym=..." param purely so the table's
+    LinkColumn can display it (via a display_text regex) while the
+    whole cell stays a clickable link — Upstox ignores the extra param.
+    """
+    try:
+        exchange, token = str(instrument_key).split("|", 1)
+    except ValueError:
+        return None
+    base = UPSTOX_CHART_URL_TEMPLATE.format(exchange=exchange, token=token)
+    return f"{base}&sym={symbol}"
+# ============================================================
 # ATL SCANNER — ported from atl_fetcher.py + strategy.py + the daily
 # backtest script (simulate_trade below is unchanged from the backtest).
 #
@@ -929,12 +956,18 @@ def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_ma
     )
     selected["Away %"] = selected["Away %"].clip(lower=0)
     selected["Cap"] = selected["LTP"] * selected["Lot"]
+    # Clickable link (opens this strike's chart on Upstox Pro Web) — shown
+    # in place of the plain Symbol column, see DISPLAY_COLS_ATL /
+    # ATL_COLUMN_CONFIG below.
+    selected["Chart"] = selected.apply(
+        lambda r: upstox_chart_url(r["option_key"], r["Symbol"]), axis=1
+    )
     # TGT, SL, Lot, Cap are kept in `result` even though they are no
     # longer shown in the table (DISPLAY_COLS_ATL below) — they're still
     # needed internally by check_and_alert_atl for the Telegram message
     # and the alert log.
     result = selected[[
-        "Symbol", "LTP", "ATL", "ATL Date", "Entry", "Away %", "TGT", "SL",
+        "Symbol", "Chart", "LTP", "ATL", "ATL Date", "Entry", "Away %", "TGT", "SL",
         "Status", "Lot", "Cap"
     ]].copy()
     for col in ["LTP", "ATL", "Entry", "Away %", "TGT", "SL"]:
@@ -964,7 +997,19 @@ DECIMAL_COLS_ATL = {
 # (check_and_alert_atl) — and deliberately excluded from display.
 # TGT, SL, Lot and Cap are likewise kept out of the displayed table (they
 # still exist on the underlying DataFrame for the Telegram alert / log).
-DISPLAY_COLS_ATL = ["Symbol", "LTP", "ATL", "ATL Date", "Entry", "Away %"]
+#
+# "Chart" is the clickable strike: it holds the Upstox chart URL, and the
+# LinkColumn below relabels it "Symbol" and displays just the contract
+# name (regex grabs everything after "sym=" at the end of the URL) — so
+# it looks like the normal Symbol column but opens the chart on click.
+DISPLAY_COLS_ATL = ["Chart", "LTP", "ATL", "ATL Date", "Entry", "Away %"]
+ATL_COLUMN_CONFIG = {
+    "Chart": st.column_config.LinkColumn(
+        "Symbol",
+        display_text=r"sym=(.*)$",
+        help="Click a strike to open its chart on Upstox Pro Web.",
+    ),
+}
 CE_ATL_TINTS = {
     "Entry": {"background-color": "#E3F2FD", "color": "#0D47A1", "font-weight": "600"},
 }
@@ -986,7 +1031,10 @@ def show_atl_side_by_side(ce_table, pe_table):
                 .pipe(apply_column_tints, CE_ATL_TINTS)
                 .format(DECIMAL_COLS_ATL, na_rep="-")
             )
-            st.dataframe(ce_style, width="stretch", hide_index=True, height=table_height(ce_table))
+            st.dataframe(
+                ce_style, width="stretch", hide_index=True,
+                height=table_height(ce_table), column_config=ATL_COLUMN_CONFIG
+            )
     with col2:
         st.markdown("**Puts (PE)**")
         if pe_table.empty:
@@ -998,7 +1046,10 @@ def show_atl_side_by_side(ce_table, pe_table):
                 .pipe(apply_column_tints, PE_ATL_TINTS)
                 .format(DECIMAL_COLS_ATL, na_rep="-")
             )
-            st.dataframe(pe_style, width="stretch", hide_index=True, height=table_height(pe_table))
+            st.dataframe(
+                pe_style, width="stretch", hide_index=True,
+                height=table_height(pe_table), column_config=ATL_COLUMN_CONFIG
+            )
 # ============================================================
 # CONFIGURATION (sidebar)
 # ============================================================
