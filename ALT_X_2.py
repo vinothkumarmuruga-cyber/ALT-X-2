@@ -921,18 +921,10 @@ DECIMAL_COLS = {
     "PDL": "{:.2f}",
     "Entry": "{:.2f}",
     "Away %": "{:.2f}%",
-    "TGT": "{:.2f}",
-    "SL": "{:.2f}",
 }
-# Lot and Cap are kept out of the display (still on the DataFrame for
-# the Telegram alert / log).
-DISPLAY_COLS = ["Symbol", "LTP", "PDL", "Entry", "Away %", "TGT", "SL", "Status"]
-def style_status(value):
-    if value == "TGT Hit":
-        return "background-color: darkgreen; color: white; font-weight: bold;"
-    if value == "SL Hit":
-        return "background-color: #B71C1C; color: white; font-weight: bold;"
-    return ""
+# TGT, SL, Status, Lot and Cap are kept out of the display (still on the
+# DataFrame — Status/TGT/SL drive the filter, Telegram alert and log).
+DISPLAY_COLS = ["Symbol", "LTP", "PDL", "Entry", "Away %"]
 CE_TINTS = {
     "Entry": {"background-color": "#E3F2FD", "color": "#0D47A1", "font-weight": "600"},
 }
@@ -951,7 +943,6 @@ def show_side_by_side(ce_table, pe_table):
             ce_style = (
                 ce_table[DISPLAY_COLS].style
                 .map(style_away_percent, subset=["Away %"])
-                .map(style_status, subset=["Status"])
                 .pipe(apply_column_tints, CE_TINTS)
                 .format(DECIMAL_COLS, na_rep="-")
             )
@@ -964,7 +955,6 @@ def show_side_by_side(ce_table, pe_table):
             pe_style = (
                 pe_table[DISPLAY_COLS].style
                 .map(style_away_percent, subset=["Away %"])
-                .map(style_status, subset=["Status"])
                 .pipe(apply_column_tints, PE_TINTS)
                 .format(DECIMAL_COLS, na_rep="-")
             )
