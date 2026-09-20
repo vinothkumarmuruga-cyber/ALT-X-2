@@ -5,11 +5,8 @@ import requests
 import os
 import io
 import zipfile
-import time
 import json
 from datetime import date, datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import quote
 # ============================================================
 # IST
 # ============================================================
@@ -21,7 +18,7 @@ def get_ist_now():
 # PAGE CONFIG
 # ============================================================
 st.set_page_config(
-    page_title="ATL x2 Scanner",
+    page_title="Bhav Low x2 Scanner",
     layout="wide"
 )
 # ============================================================
@@ -193,7 +190,7 @@ def save_token(token):
 # Streamlit Cloud restart mid-day wipes this file and can cause
 # duplicate Telegram alerts for options that already fired earlier.
 # Resets automatically each new trading day. Each entry is
-# "ATL:<symbol>".
+# "BHAV:<symbol>".
 # ============================================================
 def load_trigger_alert_state():
     today_str = get_ist_now().strftime("%Y-%m-%d")
@@ -284,7 +281,7 @@ def save_last_ltp_state(ltp_map):
     if USE_GIST_PERSISTENCE:
         _gist_write_file("last_ltp_state.json", json.dumps(data))
 # ============================================================
-# ALERT LOG (CSV) — every fired ATL x2 alert gets one row here: when it
+# ALERT LOG (CSV) — every fired Bhav Low x2 alert gets one row here: when it
 # crossed, at what LTP, and what the Entry/TGT/SL levels were at that
 # moment. Lets you go back later and check whether price actually
 # reached TGT before SL, instead of trusting the fixed TGT/SL
@@ -403,189 +400,161 @@ def apply_column_tints(styler, tints):
         styler = styler.set_properties(subset=[col], **css)
     return styler
 # ============================================================
-# ATL SCANNER — ported from atl_fetcher.py + strategy.py + the daily
-# backtest script (simulate_trade below is unchanged from the backtest).
+# BHAVCOPY LOW x2 SCANNER
 #
-#   ATL (All-Time-Low) = lowest daily LOW over a user-set look-back
-#   window (sidebar "ATL Look-back (days)"). Same caveat as the
-#   original atl_fetcher.py: this is the lowest low within whatever
-#   window you fetch, not literally since listing — exactly how your
-#   script already behaved with its manual start/end date prompts.
+#   Bhav Low = the option contract's own LOW price from the uploaded
+#   NSE F&O Bhavcopy (UDiFF "LwPric" column; older layouts "LOW"),
+#   matched per contract on (symbol, expiry, strike, CE/PE).
+#   This REPLACES the old All-Time-Low taken from Upstox daily history
+#   — there is no history fetch / look-back any more.
 #
-#   Entry = ATL x ENTRY_MULT (2.0)
-#   TGT   = Entry x EXIT_MULT (2.0)   [ = ATL x 4.0 ]
-#   SL    = Entry x SL_MULT (0.5)     e.g. Entry=98.60 -> SL=49.30
-#   (all three multipliers live right here, at the top of this section —
-#   change them here if the rule ever changes.) TGT/SL/Lot/Cap are still
-#   computed internally (used for the Telegram alert message and the
-#   alert log) but are no longer shown in the on-screen table — see
-#   DISPLAY_COLS_ATL below.
+#   Entry = Bhav Low x ENTRY_MULT (2.0)
+#   TGT   = Entry x EXIT_MULT (2.0)   [ = Bhav Low x 4.0 ]
+#   SL    = Entry x SL_MULT (0.5)     [ = Bhav Low ]
+#   (all three multipliers live right here — change them here if the
+#   rule ever changes.) TGT/SL/Lot/Cap are still computed internally
+#   (Telegram alert message + alert log) but are not shown in the
+#   on-screen table — see DISPLAY_COLS below.
 #
-#   Status (Open / TGT Hit / SL Hit / Not Triggered) is resolved in two
-#   layers, purely internally — it is used to decide WHICH contracts
-#   qualify to be shown (only genuinely triggered ones) and to detect a
-#   fresh trigger for the Telegram alert, but is not itself rendered as
-#   a table column:
-#     1) a HISTORICAL pass over the look-back window's completed daily
-#        candles using simulate_trade() unchanged from the backtest
-#        script (same same-day tie-break: if a single day's range spans
-#        both TGT and SL, assume SL hit first);
-#     2) a LIVE overlay using today's still-forming daily candle
-#        (fetched once per refresh, batched across every instrument)
-#        to catch a fresh trigger/TGT/SL happening today, without
-#        re-fetching/re-simulating the whole history every refresh.
-#   Only contracts whose entry has actually triggered (historically or
-#   today) are shown — a "genuine signals only" table, not a watchlist
-#   of every ATM strike.
+#   Status (Not Triggered / Open / TGT Hit / SL Hit) is resolved from
+#   TODAY's live daily candle (running high/low, one batched Upstox
+#   call per refresh). It is internal only: it decides which contracts
+#   qualify to be shown (today's high >= Entry) and is not itself a
+#   table column.
 # ============================================================
-ENTRY_MULT = 2.0   # Entry = ATL * ENTRY_MULT
+ENTRY_MULT = 2.0   # Entry = Bhav Low * ENTRY_MULT
 EXIT_MULT = 2.0    # TGT   = Entry * EXIT_MULT
 SL_MULT = 0.5      # SL    = Entry * SL_MULT
-MIN_ATL = 3.0      # Options whose ATL is below this (in rupees) are dropped from the table entirely
-ATL_HIST_UNIT = "days"
-ATL_HIST_INTERVAL = "1"
-def fetch_atl_history(instrument_key, headers, from_date, to_date, max_retries=2):
+MIN_LOW = 3.0      # Options whose Bhav Low is below this (in rupees) are dropped entirely
+def _parse_expiry_series(s):
+    """Bhavcopy expiry strings -> datetime.date. Handles UDiFF
+    (YYYY-MM-DD) and the older DD-Mon-YYYY layout."""
+    s = s.astype(str).str.strip()
+    out = pd.to_datetime(s, format="%Y-%m-%d", errors="coerce")
+    missing = out.isna()
+    if missing.any():
+        out.loc[missing] = pd.to_datetime(s[missing], format="%d-%b-%Y", errors="coerce")
+    missing = out.isna()
+    if missing.any():
+        out.loc[missing] = pd.to_datetime(s[missing], errors="coerce", dayfirst=True)
+    return out.dt.date
+@st.cache_data(show_spinner=False)
+def _parse_bhavcopy_bytes(name, raw_bytes):
     """
-    Daily candles for `instrument_key` between from_date and to_date (date
-    objects), sorted oldest -> newest. Same URL shape as atl_fetcher.py /
-    the backtest script. Returns None if nothing came back after retries.
+    Returns (price_map, low_map, bhav_date, error).
+      price_map: {symbol: underlying price}  -> strike selection
+      low_map:   {(symbol, expiry_date, strike, "CE"/"PE"): LOW price}
+                 -> Entry = LOW x 2
+      bhav_date: trade date string found in the file (or None)
     """
-    encoded_key = quote(instrument_key, safe="")
-    url = (
-        f"https://api.upstox.com/v3/historical-candle/"
-        f"{encoded_key}/{ATL_HIST_UNIT}/{ATL_HIST_INTERVAL}/"
-        f"{to_date.isoformat()}/{from_date.isoformat()}"
-    )
-    attempt = 0
-    while True:
-        try:
-            response = requests.get(url, headers=headers, timeout=20)
-        except requests.RequestException:
-            if attempt < max_retries:
-                time.sleep(1.5 * (attempt + 1))
-                attempt += 1
-                continue
-            return None
-        if response.status_code == 429:
-            if attempt < max_retries:
-                time.sleep(1.5 * (attempt + 1))
-                attempt += 1
-                continue
-            return None
-        if response.status_code != 200:
-            return None
-        candles = (response.json().get("data") or {}).get("candles") or []
-        if not candles:
-            return None
-        df = pd.DataFrame(
-            candles,
-            columns=["timestamp", "open", "high", "low", "close", "volume", "oi"],
+    name = name.lower()
+    try:
+        if name.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+                csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                if not csv_names:
+                    return {}, {}, None, "No CSV found inside the uploaded zip."
+                with zf.open(csv_names[0]) as f:
+                    df = pd.read_csv(f)
+        elif name.endswith(".gz"):
+            df = pd.read_csv(io.BytesIO(raw_bytes), compression="gzip")
+        else:
+            df = pd.read_csv(io.BytesIO(raw_bytes))
+    except Exception as e:
+        return {}, {}, None, f"Could not read Bhavcopy file: {e}"
+    df.columns = [str(c).strip() for c in df.columns]
+    symbol_col = next((c for c in ["TckrSymb", "SYMBOL", "Symbol"] if c in df.columns), None)
+    if symbol_col is None:
+        return {}, {}, None, "Bhavcopy is missing a symbol column (expected TckrSymb / SYMBOL)."
+    # ---------- strike-selection reference price (unchanged) ----------
+    price_col = next((c for c in ["UndrlygPric", "UNDRLYPRC", "UnderlyingPrice"] if c in df.columns), None)
+    if price_col is not None:
+        work_df = df
+    else:
+        instr_col = next((c for c in ["FinInstrmTp", "INSTRUMENT"] if c in df.columns), None)
+        close_col = next((c for c in ["ClsPric", "CLOSE"] if c in df.columns), None)
+        if instr_col is None or close_col is None:
+            return {}, {}, None, "Bhavcopy has neither UndrlygPric nor a recognizable FUT close column."
+        work_df = df[df[instr_col].astype(str).str.contains("F", case=False, na=False)]
+        price_col = close_col
+    work_df = work_df.copy()
+    work_df[price_col] = pd.to_numeric(work_df[price_col], errors="coerce")
+    price_map = work_df.dropna(subset=[price_col]).groupby(symbol_col)[price_col].first().to_dict()
+    if not price_map:
+        return {}, {}, None, "Bhavcopy parsed but no usable prices were found in it."
+    # ---------- per-option LOW price ----------
+    low_col = next((c for c in ["LwPric", "LOW", "LowPric", "Low"] if c in df.columns), None)
+    opt_col = next((c for c in ["OptnTp", "OPTION_TYP"] if c in df.columns), None)
+    strike_col = next((c for c in ["StrkPric", "STRIKE_PR"] if c in df.columns), None)
+    exp_col = next((c for c in ["XpryDt", "EXPIRY_DT", "FininstrmActlXpryDt"] if c in df.columns), None)
+    if None in (low_col, opt_col, strike_col, exp_col):
+        return {}, {}, None, (
+            "Bhavcopy is missing option Low columns "
+            "(need LwPric/LOW + OptnTp + StrkPric + XpryDt)."
         )
-        for col in ["open", "high", "low", "close"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        df = df.dropna(subset=["open", "high", "low", "close"])
-        df = df.sort_values("timestamp").reset_index(drop=True)
-        return df if not df.empty else None
-def simulate_trade(candles, entry, exit_target, sl):
-    """
-    Unchanged from the backtest script. candles: DataFrame sorted oldest ->
-    newest with high/low/timestamp columns. Returns a dict describing the
-    outcome: NOT_TRIGGERED / TARGET / SL / OPEN.
-    """
-    entry_date = None
-    for _, row in candles.iterrows():
-        if entry_date is None:
-            if row["high"] >= entry:
-                entry_date = row["timestamp"]
-            else:
-                continue  # still waiting for entry, nothing else to check yet
-        hit_sl = row["low"] <= sl
-        hit_target = row["high"] >= exit_target
-        if hit_sl and hit_target:
-            # Can't tell intraday order from daily candles -> assume SL first
-            return {
-                "result": "SL", "entry_date": entry_date,
-                "exit_date": row["timestamp"], "exit_price": sl,
-            }
-        if hit_sl:
-            return {
-                "result": "SL", "entry_date": entry_date,
-                "exit_date": row["timestamp"], "exit_price": sl,
-            }
-        if hit_target:
-            return {
-                "result": "TARGET", "entry_date": entry_date,
-                "exit_date": row["timestamp"], "exit_price": exit_target,
-            }
-    if entry_date is None:
-        return {"result": "NOT_TRIGGERED", "entry_date": None, "exit_date": None, "exit_price": None}
-    last_close = candles.iloc[-1]["close"]
-    return {
-        "result": "OPEN", "entry_date": entry_date,
-        "exit_date": candles.iloc[-1]["timestamp"], "exit_price": last_close,
+    opts = df[df[opt_col].astype(str).str.strip().str.upper().isin(["CE", "PE"])].copy()
+    opts["_low"] = pd.to_numeric(opts[low_col], errors="coerce")
+    opts["_strike"] = pd.to_numeric(opts[strike_col], errors="coerce").round(2)
+    opts["_exp"] = _parse_expiry_series(opts[exp_col])
+    opts["_sym"] = opts[symbol_col].astype(str).str.strip()
+    opts["_ot"] = opts[opt_col].astype(str).str.strip().str.upper()
+    opts = opts[opts["_low"] > 0].dropna(subset=["_strike", "_exp"])
+    if opts.empty:
+        return {}, {}, None, "Bhavcopy parsed but no option Low prices were found in it."
+    low_map = {
+        (sym, exp, float(strike), ot): float(low)
+        for sym, exp, strike, ot, low in zip(
+            opts["_sym"], opts["_exp"], opts["_strike"], opts["_ot"], opts["_low"]
+        )
     }
-def _fetch_single_atl_data(instrument_key, headers, from_date, to_date, max_retries=2):
-    candles = fetch_atl_history(instrument_key, headers, from_date, to_date, max_retries)
-    if candles is None or candles.empty:
-        return instrument_key, None, "No historical daily candles in look-back window"
-    atl_idx = candles["low"].idxmin()
-    atl = candles.loc[atl_idx, "low"]
-    atl_timestamp = candles.loc[atl_idx, "timestamp"]
-    if atl in (None, 0) or pd.isna(atl):
-        return instrument_key, None, "Invalid ATL (zero/NaN low)"
-    entry = atl * ENTRY_MULT
-    tgt = entry * EXIT_MULT
-    sl = entry * SL_MULT
-    sim = simulate_trade(candles, entry, tgt, sl)
-    info = {
-        "atl": atl,
-        # Plain "YYYY-MM-DD" string, not a Timestamp — otherwise it
-        # displays with a time-of-day and +05:30 offset (e.g.
-        # "2026-08-10 00:00:00+05:30") instead of just "2026-08-10".
-        "atl_date": atl_timestamp.strftime("%Y-%m-%d") if pd.notna(atl_timestamp) else None,
-        "entry": entry,
-        "tgt": tgt,
-        "sl": sl,
-        "hist_status": sim["result"],
-    }
-    return instrument_key, info, None
-@st.cache_data(ttl=1800, show_spinner="Scanning ATL look-back history...")
-def fetch_atl_map(instrument_keys, headers_tuple, from_date_iso, to_date_iso):
-    headers = dict(headers_tuple)
-    from_date = datetime.strptime(from_date_iso, "%Y-%m-%d").date()
-    to_date = datetime.strptime(to_date_iso, "%Y-%m-%d").date()
-    result = {}
-    sample_errors = []
-    instrument_keys = list(instrument_keys)
-    # Conservative batching (modest concurrency, small batches, short
-    # pause between them) to avoid tripping Upstox's rate limiter.
-    # Daily-candle history is cached for 30 minutes (ttl above) since it
-    # barely changes intraday, so this heavy pass runs far less often
-    # than the live overlay below.
-    batch_size = 10
-    pause_between_batches = 0.6
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        for i in range(0, len(instrument_keys), batch_size):
-            batch = instrument_keys[i:i + batch_size]
-            futures = {
-                executor.submit(_fetch_single_atl_data, key, headers, from_date, to_date): key
-                for key in batch
-            }
-            for future in as_completed(futures):
-                key, info, error = future.result()
-                result[key] = info
-                if error and len(sample_errors) < 5:
-                    sample_errors.append(f"{key} -> {error}")
-            if i + batch_size < len(instrument_keys):
-                time.sleep(pause_between_batches)
-    return result, sample_errors
+    # ---------- trade date (display only) ----------
+    bhav_date = None
+    date_col = next((c for c in ["TradDt", "BizDt", "TIMESTAMP"] if c in df.columns), None)
+    if date_col is not None:
+        parsed = pd.to_datetime(df[date_col].dropna().astype(str).str.strip(), errors="coerce").dropna()
+        if not parsed.empty:
+            bhav_date = parsed.iloc[0].strftime("%Y-%m-%d")
+    return price_map, low_map, bhav_date, None
+def parse_bhavcopy(uploaded_file):
+    if uploaded_file is None:
+        return {}, {}, None, None
+    return _parse_bhavcopy_bytes(uploaded_file.name, uploaded_file.getvalue())
+def render_bhavcopy_uploader(container):
+    """
+    Renders the Bhavcopy uploader + status message in the given
+    Streamlit container and returns (price_map, low_map, bhav_date).
+    The Bhavcopy is REQUIRED: it supplies both the strike-selection
+    reference price and each option's Low price (Entry = Low x 2).
+    """
+    container.markdown("**Bhavcopy (Strike Ref + Low) — required**")
+    bhavcopy_file = container.file_uploader(
+        "Upload NSE F&O Bhavcopy",
+        type=["csv", "gz", "zip"],
+        help=(
+            "REQUIRED. (1) 'UndrlygPric' per symbol picks the nearest CE/PE "
+            "strike (falls back to the FUT close on older layouts). "
+            "(2) Each option's own 'LwPric' (older layouts: 'LOW') is the "
+            "base for Entry = Low x 2."
+        ),
+        key="bhavcopy_uploader",
+    )
+    price_map, low_map, bhav_date, error = parse_bhavcopy(bhavcopy_file)
+    if bhavcopy_file is not None:
+        if error:
+            container.error(f"Bhavcopy: {error}")
+        else:
+            container.success(
+                f"Bhavcopy loaded — {len(price_map)} underlyings, {len(low_map)} option lows"
+                + (f" ({bhav_date})." if bhav_date else ".")
+            )
+    else:
+        container.warning("No Bhavcopy uploaded yet — required.")
+    return price_map, low_map, bhav_date
 def fetch_today_live_ohlc(instrument_keys, headers):
     """
-    Today's still-forming daily candle (running high/low) plus LTP, for
-    the live overlay on top of the cached historical ATL pass. One
-    batched call across all instruments via Upstox's v3 OHLC endpoint,
-    extracting high/low/last_price.
+    Today's still-forming daily candle (running high/low) plus LTP.
+    One batched call across all instruments via Upstox's v3 OHLC
+    endpoint, extracting high/low/last_price.
     """
     url = "https://api.upstox.com/v3/market-quote/ohlc"
     rows = []
@@ -612,74 +581,42 @@ def fetch_today_live_ohlc(instrument_keys, headers):
                 "today_low": live.get("low"),
                 "today_ltp": item.get("last_price"),
             })
-    return pd.DataFrame(rows)
-def _resolve_atl_status(row):
+    return pd.DataFrame(rows, columns=["instrument_key", "today_high", "today_low", "today_ltp"])
+def _resolve_status(row):
     """
-    Combines the cached historical result (simulate_trade over the whole
-    look-back window) with today's live overlay to get a single current
-    status: "Not Triggered" / "Open" / "TGT Hit" / "SL Hit". Whether this
-    is the very first day Entry was ever crossed (vs. having already
-    triggered on some earlier day within the look-back window) makes no
-    difference here — that distinction used to gate the Telegram alert,
-    but doing so meant most contracts (having likely crossed 2x-ATL at
-    some point over the whole look-back window already) could never
-    alert at all. See check_and_alert_atl for how alerting is decided
-    now — it dedupes per calendar day instead, off this Status value.
+    Not Triggered / Open / TGT Hit / SL Hit, from today's live candle
+    only. Triggered = today's running high has reached Entry.
+    Same-candle tie-break as before: if SL and TGT both fall inside the
+    range, SL is assumed first.
     """
-    hist = row["_hist_status"]
     entry, tgt, sl = row["Entry"], row["TGT"], row["SL"]
     today_high, today_low = row.get("today_high"), row.get("today_low")
-    if hist == "TARGET":
-        return "TGT Hit"
-    if hist == "SL":
-        return "SL Hit"
-    if hist == "OPEN":
-        # Entry already triggered on a past day within the look-back
-        # window; today just decides whether TGT/SL finally hits.
-        hit_tgt = pd.notna(today_high) and today_high >= tgt
-        hit_sl = pd.notna(today_low) and today_low <= sl
-        if hit_sl:
-            return "SL Hit"  # same tie-break as simulate_trade
-        if hit_tgt:
-            return "TGT Hit"
-        return "Open"
-    # hist == "NOT_TRIGGERED": entry not yet hit as of yesterday's close.
-    hit_entry_today = pd.notna(today_high) and today_high >= entry
-    if not hit_entry_today:
+    if pd.isna(entry) or pd.isna(today_high) or today_high < entry:
         return "Not Triggered"
-    hit_tgt = pd.notna(today_high) and today_high >= tgt
-    hit_sl = pd.notna(today_low) and today_low <= sl
-    if hit_sl:
+    if pd.notna(today_low) and today_low <= sl:
         return "SL Hit"
-    if hit_tgt:
+    if today_high >= tgt:
         return "TGT Hit"
     return "Open"
-def check_and_alert_atl(df, telegram_enabled, bot_token, chat_id):
+def check_and_alert(df, telegram_enabled, bot_token, chat_id):
     """
-    ATL x2 scanner: alerts a symbol only on a genuine FRESH CROSSOVER of
-    its Entry level — the previously-seen LTP was below Entry and the
-    current LTP is at/above it. This is checked fresh every refresh off
-    the current quote, not off the historical Status column, because
-    Status ("Open" in particular) reflects a contract that triggered on
-    ANY day within the whole look-back window and stays "Open" even if
-    price has since fallen back below Entry.
+    Bhav Low x2 scanner: alerts a symbol only on a genuine FRESH CROSSOVER
+    of its Entry level — the previously-seen LTP was below Entry and the
+    current LTP is at/above it. Checked fresh every refresh off the
+    current quote, not off the Status column.
 
     Requiring an actual prev-below / now-above edge (via
     load_last_ltp_state / save_last_ltp_state) — rather than simply
     "LTP >= Entry right now" — avoids a stale-looking alert firing the
     moment Telegram gets enabled, the app restarts, or "Reset Alerts" is
-    clicked while price is already sitting well past Entry (e.g. an
-    Away % of 127% or 192%, far beyond the 100% mark that means "just
-    crossed"). On the first observation of a symbol in a session/day
-    there is no prior LTP to compare against, so that refresh only seeds
-    the baseline and never fires an alert by itself — the earliest a
-    symbol can alert is the refresh after one where it was seen below
-    Entry.
+    clicked while price is already sitting well past Entry. On the first
+    observation of a symbol in a session/day there is no prior LTP to
+    compare against, so that refresh only seeds the baseline and never
+    fires an alert by itself.
 
     Still de-duplicated per calendar day via the persisted alert-state
-    file (tagged "ATL:<symbol>", reset automatically each trading day)
-    on top of the crossover check, so a symbol that re-alerts logic
-    doesn't fire twice for the same crossing across retries.
+    file (tagged "BHAV:<symbol>", reset automatically each trading day)
+    on top of the crossover check.
     """
     if not telegram_enabled:
         return
@@ -704,7 +641,7 @@ def check_and_alert_atl(df, telegram_enabled, bot_token, chat_id):
             continue  # no prior below-Entry baseline to cross FROM this refresh
         if ltp < entry:
             continue  # hasn't crossed yet
-        alert_id = f"ATL:{symbol}"
+        alert_id = f"BHAV:{symbol}"
         if alert_id not in alerted:
             newly_triggered.append((alert_id, row))
     if ltp_state_changed:
@@ -715,9 +652,10 @@ def check_and_alert_atl(df, telegram_enabled, bot_token, chat_id):
     fail_count = 0
     for alert_id, row in newly_triggered:
         message = (
-            "🚀 <b>ATL x2 — Entry Triggered</b>\n\n"
+            "🚀 <b>Bhav Low x2 — Entry Triggered</b>\n\n"
             f"<b>{row['Symbol']}</b>\n"
             f"LTP: {row['LTP']:.2f}\n"
+            f"Bhav Low: {row['Bhav Low']:.2f}\n"
             f"Entry: {row['Entry']:.2f}\n"
             f"TGT: {row['TGT']:.2f}  |  SL: {row['SL']:.2f}\n"
             f"Away %: {row['Away %']:.2f}%\n"
@@ -727,117 +665,15 @@ def check_and_alert_atl(df, telegram_enabled, bot_token, chat_id):
         if success:
             alerted.add(alert_id)
             save_trigger_alert_state(alerted)
-            log_alert_event("ATL", row['Symbol'], row['LTP'], row['Entry'], tgt=row['TGT'], sl=row['SL'])
+            log_alert_event("BHAV", row['Symbol'], row['LTP'], row['Entry'], tgt=row['TGT'], sl=row['SL'])
             sent_count += 1
         else:
             fail_count += 1
     if sent_count:
-        st.toast(f"Telegram alert sent for {sent_count} ATL entry trigger(s).", icon="🚀")
+        st.toast(f"Telegram alert sent for {sent_count} entry trigger(s).", icon="🚀")
     if fail_count:
-        st.toast(f"{fail_count} ATL alert(s) failed — will retry next refresh.", icon="⚠️")
-# ============================================================
-# BHAVCOPY-BASED STRIKE-SELECTION REFERENCE PRICE
-#
-# nearest_option() needs one reference price per underlying to pick the
-# nearest CE/PE strike. This is now sourced ENTIRELY from an uploaded
-# NSE F&O Bhavcopy — there is no live Upstox futures-open fetch and no
-# monthly-open fallback any more. Without a Bhavcopy uploaded, the
-# scanner refuses to run (build_atl_scanner errors out and returns
-# empty tables) rather than falling back to a live-computed price.
-#
-# Upload the daily UDiFF "BhavCopy_NSE_FO_0_0_0_<date>_F_0000.csv"
-# report in the sidebar (also accepted as .csv.gz, or the .zip NSE
-# distributes it in). Its per-row "UndrlygPric" column (NSE's own
-# published underlying closing price for that contract) is grouped by
-# symbol into one price per underlying. Older Bhavcopy layouts that
-# don't publish UndrlygPric fall back to the FUT row's own closing
-# price (INSTRUMENT/ClsPric) instead — that's the only fallback left.
-#
-# This is looked up by underlying SYMBOL (e.g. "RELIANCE"), not by
-# Upstox instrument_key, since that's what a Bhavcopy row identifies.
-# Any underlying not found in the uploaded file is simply dropped from
-# the scan (reported in an expander in build_atl_scanner) rather than
-# substituted with a live price.
-# ============================================================
-def parse_bhavcopy_underlying_prices(uploaded_file):
-    """
-    Returns (price_map, error): price_map is {symbol: price} built from
-    the uploaded NSE F&O Bhavcopy file. error is None on success, or a
-    short message to show the user if the file couldn't be parsed.
-    Returns ({}, None) if uploaded_file is None (nothing uploaded yet).
-    """
-    if uploaded_file is None:
-        return {}, None
-    name = uploaded_file.name.lower()
-    try:
-        raw_bytes = uploaded_file.getvalue()
-        if name.endswith(".zip"):
-            with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
-                csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-                if not csv_names:
-                    return {}, "No CSV found inside the uploaded zip."
-                with zf.open(csv_names[0]) as f:
-                    df = pd.read_csv(f)
-        elif name.endswith(".gz"):
-            df = pd.read_csv(io.BytesIO(raw_bytes), compression="gzip")
-        else:
-            df = pd.read_csv(io.BytesIO(raw_bytes))
-    except Exception as e:
-        return {}, f"Could not read Bhavcopy file: {e}"
-    df.columns = [str(c).strip() for c in df.columns]
-    symbol_col = next((c for c in ["TckrSymb", "SYMBOL", "Symbol"] if c in df.columns), None)
-    if symbol_col is None:
-        return {}, "Bhavcopy is missing a symbol column (expected TckrSymb / SYMBOL)."
-    price_col = next((c for c in ["UndrlygPric", "UNDRLYPRC", "UnderlyingPrice"] if c in df.columns), None)
-    if price_col is not None:
-        work_df = df
-    else:
-        # Older layouts don't publish UndrlygPric — fall back to the
-        # futures row's own closing price for that underlying.
-        instr_col = next((c for c in ["FinInstrmTp", "INSTRUMENT"] if c in df.columns), None)
-        close_col = next((c for c in ["ClsPric", "CLOSE"] if c in df.columns), None)
-        if instr_col is None or close_col is None:
-            return {}, "Bhavcopy has neither UndrlygPric nor a recognizable FUT close column."
-        work_df = df[df[instr_col].astype(str).str.contains("F", case=False, na=False)]
-        price_col = close_col
-    work_df = work_df.copy()
-    work_df[price_col] = pd.to_numeric(work_df[price_col], errors="coerce")
-    price_map = work_df.dropna(subset=[price_col]).groupby(symbol_col)[price_col].first().to_dict()
-    if not price_map:
-        return {}, "Bhavcopy parsed but no usable prices were found in it."
-    return price_map, None
-def render_bhavcopy_uploader(container):
-    """
-    Renders the Bhavcopy uploader + status message in the given
-    Streamlit container (st.sidebar in the normal view, or st itself in
-    client view where the sidebar is hidden via CSS), and returns the
-    parsed {symbol: price} map. Bhavcopy is now the ONLY source of the
-    strike-selection reference price — there is no live-price fallback
-    — so this upload is required before the scanner will run.
-    """
-    container.markdown("**Bhavcopy (Strike Reference) — required**")
-    bhavcopy_file = container.file_uploader(
-        "Upload NSE F&O Bhavcopy",
-        type=["csv", "gz", "zip"],
-        help=(
-            "REQUIRED. Strike selection (which CE/PE strike counts as "
-            "'nearest') is read entirely from this file's 'UndrlygPric' "
-            "column per symbol (falling back to the FUT row's close "
-            "price on older layouts) — there is no live-price fallback "
-            "any more. The scanner won't run without one uploaded."
-        ),
-        key="bhavcopy_uploader",
-    )
-    price_map, error = parse_bhavcopy_underlying_prices(bhavcopy_file)
-    if bhavcopy_file is not None:
-        if error:
-            container.error(f"Bhavcopy: {error}")
-        else:
-            container.success(f"Bhavcopy loaded — {len(price_map)} underlying symbols.")
-    else:
-        container.warning("No Bhavcopy uploaded yet — required for strike selection.")
-    return price_map
-def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_map=None):
+        st.toast(f"{fail_count} alert(s) failed — will retry next refresh.", icon="⚠️")
+def build_scanner(access_token, expiry_choice, bhavcopy_price_map, bhavcopy_low_map):
     headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {access_token}"
@@ -849,14 +685,10 @@ def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_ma
         return pd.DataFrame(), pd.DataFrame()
     futures = futures[futures["expiry_date"] == expiry].copy()
     options = options[options["expiry_date"] == expiry].copy()
-    bhavcopy_price_map = bhavcopy_price_map or {}
-    if not bhavcopy_price_map:
-        st.error("Upload an NSE F&O Bhavcopy in the sidebar first — strike selection now reads its reference price from the Bhavcopy only.")
+    if not bhavcopy_price_map or not bhavcopy_low_map:
+        st.error("Upload an NSE F&O Bhavcopy in the sidebar first — strike selection and the Low x2 Entry both come from it.")
         return pd.DataFrame(), pd.DataFrame()
-    # Strike selection reference price comes ONLY from the uploaded
-    # Bhavcopy's per-symbol price (see parse_bhavcopy_underlying_prices
-    # above) — no live futures-open fetch, no monthly-open fallback. Any
-    # underlying not present in the uploaded file is simply dropped.
+    # Strike selection reference price: uploaded Bhavcopy only.
     futures["future_open"] = futures["underlying_symbol"].map(bhavcopy_price_map)
     dropped = futures[futures["future_open"].isna()]["underlying_symbol"].unique().tolist()
     futures = futures.dropna(subset=["future_open"])
@@ -889,38 +721,39 @@ def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_ma
         + selected["strike"].astype(int).astype(str) + " "
         + selected["option_type"].astype(str)
     )
-    today = get_ist_now().date()
-    from_date = start_date
-    to_date = today - timedelta(days=1)  # historical endpoint won't have today yet
-    atl_map, atl_errors = fetch_atl_map(
-        tuple(sorted(selected["option_key"].unique())),
-        tuple(headers.items()),
-        from_date.isoformat(),
-        to_date.isoformat(),
+    # ---- Bhav Low per contract: (symbol, expiry, strike, CE/PE) ----
+    low_keys = [
+        (str(sym).strip(), expiry, float(round(float(strike), 2)), str(ot).strip().upper())
+        for sym, strike, ot in zip(
+            selected["underlying_symbol"], selected["strike"], selected["option_type"]
+        )
+    ]
+    selected["Bhav Low"] = pd.to_numeric(
+        pd.Series([bhavcopy_low_map.get(k) for k in low_keys], index=selected.index),
+        errors="coerce"
     )
-    def _atl_field(key, field, default=None):
-        info = atl_map.get(key)
-        return info.get(field, default) if info else default
-    selected["ATL"] = pd.to_numeric(selected["option_key"].apply(lambda k: _atl_field(k, "atl")), errors="coerce")
-    selected["ATL Date"] = selected["option_key"].apply(lambda k: _atl_field(k, "atl_date"))
-    selected["Entry"] = pd.to_numeric(selected["option_key"].apply(lambda k: _atl_field(k, "entry")), errors="coerce")
-    selected["TGT"] = pd.to_numeric(selected["option_key"].apply(lambda k: _atl_field(k, "tgt")), errors="coerce")
-    selected["SL"] = pd.to_numeric(selected["option_key"].apply(lambda k: _atl_field(k, "sl")), errors="coerce")
-    selected["_hist_status"] = selected["option_key"].apply(lambda k: _atl_field(k, "hist_status", "NOT_TRIGGERED"))
-    missing_count = selected["ATL"].isna().sum()
+    missing_count = int(selected["Bhav Low"].isna().sum())
     total_count = len(selected)
     if missing_count > 0:
         with st.expander(
-            f"⚠️ ATL not available for {missing_count}/{total_count} options (hidden from table below)",
+            f"⚠️ Bhavcopy Low not found for {missing_count}/{total_count} options (hidden from table below)",
             expanded=(missing_count == total_count)
         ):
-            st.write(f"Needs at least one completed daily candle between {from_date} and {to_date}. Can also happen on rate-limited requests — those retry within 30 minutes (ATL cache TTL).")
-            if atl_errors:
-                for err in atl_errors:
-                    st.code(err)
+            st.write(
+                f"No matching row (symbol + expiry {expiry} + strike + CE/PE) with a Low > 0 "
+                "in the uploaded Bhavcopy — contract may not have traded, or the file is for a different expiry."
+            )
+            st.write(", ".join(selected.loc[selected["Bhav Low"].isna(), "Symbol"].tolist()[:50]))
+    # Drop missing + penny lows BEFORE hitting the live quote API.
+    selected = selected[selected["Bhav Low"] >= MIN_LOW].reset_index(drop=True)
+    if selected.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    selected["Entry"] = selected["Bhav Low"] * ENTRY_MULT
+    selected["TGT"] = selected["Entry"] * EXIT_MULT
+    selected["SL"] = selected["Entry"] * SL_MULT
     live_ohlc = fetch_today_live_ohlc(selected["option_key"].tolist(), headers)
     selected = selected.merge(live_ohlc, left_on="option_key", right_on="instrument_key", how="left")
-    selected["Status"] = selected.apply(_resolve_atl_status, axis=1)
+    selected["Status"] = selected.apply(_resolve_status, axis=1)
     selected["LTP"] = pd.to_numeric(selected["today_ltp"], errors="coerce")
     selected["Away %"] = np.where(
         selected["Entry"] > 0,
@@ -929,49 +762,38 @@ def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_ma
     )
     selected["Away %"] = selected["Away %"].clip(lower=0)
     selected["Cap"] = selected["LTP"] * selected["Lot"]
-    # TGT, SL, Lot, Cap are kept in `result` even though they are no
-    # longer shown in the table (DISPLAY_COLS_ATL below) — they're still
-    # needed internally by check_and_alert_atl for the Telegram message
-    # and the alert log.
+    # TGT, SL, Lot, Cap stay in `result` (Telegram message + alert log)
+    # even though they are not shown in the table (DISPLAY_COLS below).
     result = selected[[
-        "Symbol", "LTP", "ATL", "ATL Date", "Entry", "Away %", "TGT", "SL",
+        "Symbol", "LTP", "Bhav Low", "Entry", "Away %", "TGT", "SL",
         "Status", "Lot", "Cap"
     ]].copy()
-    for col in ["LTP", "ATL", "Entry", "Away %", "TGT", "SL"]:
+    for col in ["LTP", "Bhav Low", "Entry", "Away %", "TGT", "SL"]:
         result[col] = pd.to_numeric(result[col], errors="coerce").round(2)
     result["Lot"] = pd.to_numeric(result["Lot"], errors="coerce").fillna(0).astype(int)
     result["Cap"] = pd.to_numeric(result["Cap"], errors="coerce").round(0).fillna(0).astype(int)
-    # Only show contracts whose entry has actually triggered — historically
-    # within the look-back window, or live today — not a watchlist of every
-    # ATM strike. Status itself stays internal (used here for the filter and
-    # for the Telegram alert) and is not rendered as a table column.
+    # Only contracts whose Entry has actually been reached today.
     result = result[result["Status"] != "Not Triggered"].reset_index(drop=True)
-    # Drop options whose ATL is a "penny" price below MIN_ATL rupees — these
-    # are typically deep OTM/illiquid strikes where the ATL x2/x4 levels are
-    # not meaningful trade levels.
-    result = result[result["ATL"] >= MIN_ATL].reset_index(drop=True)
     ce_table = result[result["Symbol"].str.endswith("CE")].sort_values("Away %", ascending=False, na_position="last").reset_index(drop=True)
     pe_table = result[result["Symbol"].str.endswith("PE")].sort_values("Away %", ascending=False, na_position="last").reset_index(drop=True)
     return ce_table, pe_table
-DECIMAL_COLS_ATL = {
+DECIMAL_COLS = {
     "LTP": "{:.2f}",
-    "ATL": "{:.2f}",
+    "Bhav Low": "{:.2f}",
     "Entry": "{:.2f}",
     "Away %": "{:.2f}%",
 }
-# "Status" is internal-only — used to filter to genuinely-triggered
-# contracts (build_atl_scanner) and to decide alert eligibility
-# (check_and_alert_atl) — and deliberately excluded from display.
-# TGT, SL, Lot and Cap are likewise kept out of the displayed table (they
-# still exist on the underlying DataFrame for the Telegram alert / log).
-DISPLAY_COLS_ATL = ["Symbol", "LTP", "ATL", "ATL Date", "Entry", "Away %"]
-CE_ATL_TINTS = {
+# "Status" is internal-only (filter + alert eligibility). TGT, SL, Lot
+# and Cap are kept out of the display too (still on the DataFrame for
+# the Telegram alert / log).
+DISPLAY_COLS = ["Symbol", "LTP", "Bhav Low", "Entry", "Away %"]
+CE_TINTS = {
     "Entry": {"background-color": "#E3F2FD", "color": "#0D47A1", "font-weight": "600"},
 }
-PE_ATL_TINTS = {
+PE_TINTS = {
     "Entry": {"background-color": "#EDE7F6", "color": "#4527A0", "font-weight": "600"},
 }
-def show_atl_side_by_side(ce_table, pe_table):
+def show_side_by_side(ce_table, pe_table):
     last_updated = get_ist_now().strftime("%H:%M:%S")
     st.caption(f"Last Updated: {last_updated} IST")
     col1, col2 = st.columns(2)
@@ -981,10 +803,10 @@ def show_atl_side_by_side(ce_table, pe_table):
             st.info("No CE data available.")
         else:
             ce_style = (
-                ce_table[DISPLAY_COLS_ATL].style
+                ce_table[DISPLAY_COLS].style
                 .map(style_away_percent, subset=["Away %"])
-                .pipe(apply_column_tints, CE_ATL_TINTS)
-                .format(DECIMAL_COLS_ATL, na_rep="-")
+                .pipe(apply_column_tints, CE_TINTS)
+                .format(DECIMAL_COLS, na_rep="-")
             )
             st.dataframe(ce_style, width="stretch", hide_index=True, height=table_height(ce_table))
     with col2:
@@ -993,10 +815,10 @@ def show_atl_side_by_side(ce_table, pe_table):
             st.info("No PE data available.")
         else:
             pe_style = (
-                pe_table[DISPLAY_COLS_ATL].style
+                pe_table[DISPLAY_COLS].style
                 .map(style_away_percent, subset=["Away %"])
-                .pipe(apply_column_tints, PE_ATL_TINTS)
-                .format(DECIMAL_COLS_ATL, na_rep="-")
+                .pipe(apply_column_tints, PE_TINTS)
+                .format(DECIMAL_COLS, na_rep="-")
             )
             st.dataframe(pe_style, width="stretch", hide_index=True, height=table_height(pe_table))
 # ============================================================
@@ -1013,14 +835,12 @@ if is_client_view:
     auto_refresh = True
     refresh_interval = 15
     expiry_type = "Current Month"
-    atl_start_date = get_ist_now().date() - timedelta(days=365)
     telegram_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
     telegram_enabled = bool(telegram_bot_token and telegram_chat_id)
-    # The sidebar (and its config) is hidden in client view, but the
-    # Bhavcopy upload is required and has no live-price fallback, so it
-    # gets rendered in the main body instead, above the title.
-    bhavcopy_price_map = render_bhavcopy_uploader(st)
+    # Sidebar is hidden in client view, but the Bhavcopy upload is
+    # required, so it is rendered in the main body above the title.
+    bhavcopy_price_map, bhavcopy_low_map, bhavcopy_date = render_bhavcopy_uploader(st)
     st.markdown("---")
 else:
     with st.sidebar:
@@ -1042,48 +862,15 @@ else:
             help="Which monthly expiry's ATM options the scanner tracks."
         )
         st.markdown("---")
-        st.header("Bhavcopy (Strike Reference)")
-        bhavcopy_file = st.file_uploader(
-            "Upload NSE F&O Bhavcopy",
-            type=["csv", "gz", "zip"],
-            help=(
-                "Used as the strike-selection reference price (which CE/PE "
-                "strike counts as 'nearest') instead of Upstox's live "
-                "monthly futures open. Reads the Bhavcopy's 'UndrlygPric' "
-                "column per symbol when present, falling back to the FUT "
-                "row's close price on older layouts. Any symbol not found "
-                "in the uploaded file falls back to the live monthly-open "
-                "method automatically, so this is optional."
-            )
-        )
-        bhavcopy_price_map, bhavcopy_error = parse_bhavcopy_underlying_prices(bhavcopy_file)
-        if bhavcopy_file is not None:
-            if bhavcopy_error:
-                st.error(f"Bhavcopy: {bhavcopy_error}")
-            else:
-                st.success(f"Bhavcopy loaded — {len(bhavcopy_price_map)} underlying symbols.")
-        st.markdown("---")
-        st.header("ATL x2 Scanner Settings")
-        atl_start_date = st.date_input(
-            "ATL Look-back From",
-            value=get_ist_now().date() - timedelta(days=365),
-            min_value=get_ist_now().date() - timedelta(days=3650),
-            max_value=get_ist_now().date() - timedelta(days=1),
-            help=(
-                "All-Time-Low (ATL) is the lowest daily LOW from this date "
-                "up to yesterday's close — not literally since listing, "
-                "same as the manual start/end date range in "
-                "atl_fetcher.py. Entry = ATL x 2.0, TGT = Entry x 2.0, "
-                "SL = Entry x 0.5."
-            )
-        )
+        st.header("Bhavcopy")
+        bhavcopy_price_map, bhavcopy_low_map, bhavcopy_date = render_bhavcopy_uploader(st.sidebar)
         st.markdown("---")
         st.header("Telegram Alerts")
         telegram_enabled = st.checkbox(
             "Enable Trigger Alerts",
             value=st.session_state.get("telegram_enabled", False),
             key="telegram_enabled",
-            help="Sends a Telegram message the moment an option's ATL x2 Entry level is crossed for the first time today."
+            help="Sends a Telegram message the moment an option's Bhav Low x2 Entry level is crossed for the first time today."
         )
         telegram_bot_token = st.text_input(
             "Bot Token",
@@ -1109,7 +896,7 @@ else:
             success, error = send_telegram_alert(
                 telegram_bot_token,
                 telegram_chat_id,
-                "✅ Test alert from ATL x2 Scanner — Telegram is wired up correctly."
+                "✅ Test alert from Bhav Low x2 Scanner — Telegram is wired up correctly."
             )
             if success:
                 st.success("Test message sent — check Telegram.")
@@ -1121,26 +908,29 @@ else:
         refresh_interval = st.slider("Refresh Interval (seconds)", min_value=5, max_value=60, value=15)
 # ============================================================
 # MAIN PAGE — single live scanner:
-#   ATL x2: Entry = ATL x2.0, TGT = Entry x2.0, SL = Entry x0.5
-#           (ported from atl_fetcher.py / strategy.py).
+#   Bhav Low x2: Entry = Bhavcopy option LOW x2.0,
+#                TGT = Entry x2.0, SL = Entry x0.5
 # ============================================================
-st.title("ATL x2 Scanner")
+st.title("Bhav Low x2 Scanner")
 run_every = refresh_interval if auto_refresh else None
 if not access_token:
     st.warning("Enter your Upstox Access Token in the sidebar first.")
 else:
-    st.header("All-Time-Low x2 Breakout (Live)")
-    st.caption(f"Entry = ATL x{ENTRY_MULT:g}  |  TGT = Entry x{EXIT_MULT:g}  |  SL = Entry x{SL_MULT:g}  |  Look-back from {atl_start_date}")
+    st.header("Bhavcopy Low x2 Breakout (Live)")
+    st.caption(
+        f"Entry = Bhav Low x{ENTRY_MULT:g}  |  TGT = Entry x{EXIT_MULT:g}  |  SL = Entry x{SL_MULT:g}"
+        + (f"  |  Bhavcopy date: {bhavcopy_date}" if bhavcopy_date else "")
+    )
     @st.fragment(run_every=run_every)
-    def show_atl():
-        ce_table, pe_table = build_atl_scanner(
-            access_token, expiry_type, atl_start_date, bhavcopy_price_map
+    def show_scanner():
+        ce_table, pe_table = build_scanner(
+            access_token, expiry_type, bhavcopy_price_map, bhavcopy_low_map
         )
         if not ce_table.empty or not pe_table.empty:
             if telegram_enabled:
                 combined = pd.concat([ce_table, pe_table], ignore_index=True)
-                check_and_alert_atl(combined, telegram_enabled, telegram_bot_token, telegram_chat_id)
-            show_atl_side_by_side(ce_table, pe_table)
+                check_and_alert(combined, telegram_enabled, telegram_bot_token, telegram_chat_id)
+            show_side_by_side(ce_table, pe_table)
         else:
             st.info("No triggered entries yet — waiting for market data or a breakout above Entry.")
-    show_atl()
+    show_scanner()
