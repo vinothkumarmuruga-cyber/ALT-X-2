@@ -352,14 +352,7 @@ def load_live_fo_instruments():
         (instruments["instrument_type"].isin(["CE", "PE"])) &
         (instruments["underlying_type"] == "EQUITY")
     ].copy()
-    # Underlying stock instrument_key ("NSE_EQ|INE...") -> exchange_token,
-    # used to build the Upstox stock-chart link (see upstox_chart_url).
-    equities = instruments[instruments["segment"] == "NSE_EQ"]
-    eq_tokens = dict(zip(
-        equities["instrument_key"].astype(str),
-        equities["exchange_token"].astype(str)
-    ))
-    return futures, options, eq_tokens
+    return futures, options
 def get_expiry_for_choice(df, choice):
     today = date.today()
     valid = sorted(df[df["expiry_date"] >= today]["expiry_date"].unique())
@@ -409,32 +402,6 @@ def apply_column_tints(styler, tints):
     for col, css in tints.items():
         styler = styler.set_properties(subset=[col], **css)
     return styler
-# ============================================================
-# UPSTOX CHART DEEP-LINK
-#
-# Clicking a row in the tables opens the UNDERLYING STOCK's chart (not the
-# option strike) on Upstox Pro Web in a new tab. Upstox's chart URL
-# identifies an instrument by segment ("exchange") + "chartToken", and the
-# chartToken is the instrument's exchange_token from the Upstox instrument
-# file. For a stock that is the NSE_EQ row matching the option's
-# underlying_key (see load_live_fo_instruments -> eq_tokens).
-#
-# If Upstox ever changes the chart URL format, edit ONLY
-# UPSTOX_CHART_URL_TEMPLATE below — everything else keys off it.
-# ============================================================
-UPSTOX_CHART_URL_TEMPLATE = "https://pro.upstox.com/trading-charts?exchange={exchange}&chartToken={token}"
-def upstox_chart_url(exchange, token, symbol):
-    """
-    Chart URL for one instrument. The human-readable symbol is appended
-    as a trailing "&sym=..." param purely so the table's LinkColumn can
-    display it (via a display_text regex) while the whole cell stays a
-    clickable link — Upstox ignores the extra param. Returns None if the
-    token is unknown (cell then just shows empty).
-    """
-    if not token or str(token).lower() in ("nan", "none"):
-        return None
-    base = UPSTOX_CHART_URL_TEMPLATE.format(exchange=exchange, token=token)
-    return f"{base}&sym={symbol}"
 # ============================================================
 # ATL SCANNER — ported from atl_fetcher.py + strategy.py + the daily
 # backtest script (simulate_trade below is unchanged from the backtest).
@@ -875,7 +842,7 @@ def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_ma
         "Accept": "application/json",
         "Authorization": f"Bearer {access_token}"
     }
-    futures, options, eq_tokens = load_live_fo_instruments()
+    futures, options = load_live_fo_instruments()
     expiry = get_expiry_for_choice(futures, expiry_choice)
     if expiry is None:
         st.error("No futures expiry found")
@@ -908,7 +875,6 @@ def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_ma
                 continue
             selected_rows.append({
                 "underlying_symbol": fut["underlying_symbol"],
-                "underlying_key": fut["underlying_key"],
                 "strike": opt["strike_price"],
                 "option_type": opt["instrument_type"],
                 "option_key": opt["instrument_key"],
@@ -963,19 +929,12 @@ def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_ma
     )
     selected["Away %"] = selected["Away %"].clip(lower=0)
     selected["Cap"] = selected["LTP"] * selected["Lot"]
-    # Clickable link (opens the underlying STOCK's chart on Upstox Pro Web)
-    # — shown in place of the plain Symbol column, see DISPLAY_COLS_ATL /
-    # ATL_COLUMN_CONFIG below.
-    selected["Chart"] = selected.apply(
-        lambda r: upstox_chart_url("NSE_EQ", eq_tokens.get(str(r["underlying_key"])), r["Symbol"]),
-        axis=1
-    )
     # TGT, SL, Lot, Cap are kept in `result` even though they are no
     # longer shown in the table (DISPLAY_COLS_ATL below) — they're still
     # needed internally by check_and_alert_atl for the Telegram message
     # and the alert log.
     result = selected[[
-        "Symbol", "Chart", "LTP", "ATL", "ATL Date", "Entry", "Away %", "TGT", "SL",
+        "Symbol", "LTP", "ATL", "ATL Date", "Entry", "Away %", "TGT", "SL",
         "Status", "Lot", "Cap"
     ]].copy()
     for col in ["LTP", "ATL", "Entry", "Away %", "TGT", "SL"]:
@@ -1005,19 +964,7 @@ DECIMAL_COLS_ATL = {
 # (check_and_alert_atl) — and deliberately excluded from display.
 # TGT, SL, Lot and Cap are likewise kept out of the displayed table (they
 # still exist on the underlying DataFrame for the Telegram alert / log).
-#
-# "Chart" is the clickable symbol: it holds the Upstox chart URL, and the
-# LinkColumn below relabels it "Symbol" and displays just the contract
-# name (regex grabs everything after "sym=" at the end of the URL) — so
-# it looks like the normal Symbol column but opens the chart on click.
-DISPLAY_COLS_ATL = ["Chart", "LTP", "ATL", "ATL Date", "Entry", "Away %"]
-ATL_COLUMN_CONFIG = {
-    "Chart": st.column_config.LinkColumn(
-        "Symbol",
-        display_text=r"sym=(.*)$",
-        help="Click to open the underlying stock's chart on Upstox Pro Web.",
-    ),
-}
+DISPLAY_COLS_ATL = ["Symbol", "LTP", "ATL", "ATL Date", "Entry", "Away %"]
 CE_ATL_TINTS = {
     "Entry": {"background-color": "#E3F2FD", "color": "#0D47A1", "font-weight": "600"},
 }
@@ -1039,10 +986,7 @@ def show_atl_side_by_side(ce_table, pe_table):
                 .pipe(apply_column_tints, CE_ATL_TINTS)
                 .format(DECIMAL_COLS_ATL, na_rep="-")
             )
-            st.dataframe(
-                ce_style, width="stretch", hide_index=True,
-                height=table_height(ce_table), column_config=ATL_COLUMN_CONFIG
-            )
+            st.dataframe(ce_style, width="stretch", hide_index=True, height=table_height(ce_table))
     with col2:
         st.markdown("**Puts (PE)**")
         if pe_table.empty:
@@ -1054,10 +998,7 @@ def show_atl_side_by_side(ce_table, pe_table):
                 .pipe(apply_column_tints, PE_ATL_TINTS)
                 .format(DECIMAL_COLS_ATL, na_rep="-")
             )
-            st.dataframe(
-                pe_style, width="stretch", hide_index=True,
-                height=table_height(pe_table), column_config=ATL_COLUMN_CONFIG
-            )
+            st.dataframe(pe_style, width="stretch", hide_index=True, height=table_height(pe_table))
 # ============================================================
 # CONFIGURATION (sidebar)
 # ============================================================
