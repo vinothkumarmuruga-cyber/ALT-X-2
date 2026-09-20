@@ -457,7 +457,7 @@ def apply_column_tints(styler, tints):
 #   contract on (symbol, expiry, strike, CE/PE).
 #
 #   Entry = PDL x ENTRY_MULT (2.0)
-#   TGT   = Entry x EXIT_MULT (2.0)   [ = PDL x 4.0 ]
+#   TGT   = Entry x EXIT_MULT (1.5)   [ = PDL x 3.0 ]
 #   SL    = Entry x SL_MULT (0.5)     [ = PDL ]
 #   (all three multipliers live right here.)
 #
@@ -474,7 +474,7 @@ def apply_column_tints(styler, tints):
 #                     (see FIRST-HIT STATE above).
 # ============================================================
 ENTRY_MULT = 2.0   # Entry = PDL * ENTRY_MULT
-EXIT_MULT = 2.0    # TGT   = Entry * EXIT_MULT
+EXIT_MULT = 1.5    # TGT   = Entry * EXIT_MULT
 SL_MULT = 0.5      # SL    = Entry * SL_MULT
 MIN_LOW = 3.0      # Options whose PDL is below this (in rupees) are dropped entirely
 def _parse_expiry_series(s):
@@ -921,10 +921,18 @@ DECIMAL_COLS = {
     "PDL": "{:.2f}",
     "Entry": "{:.2f}",
     "Away %": "{:.2f}%",
+    "TGT": "{:.2f}",
+    "SL": "{:.2f}",
 }
-# TGT, SL, Status, Lot and Cap are kept out of the display (still on the
-# DataFrame — Status/TGT/SL drive the filter, Telegram alert and log).
-DISPLAY_COLS = ["Symbol", "LTP", "PDL", "Entry", "Away %"]
+# Lot and Cap are kept out of the display (still on the DataFrame for the
+# Telegram alert / log).
+DISPLAY_COLS = ["Symbol", "LTP", "PDL", "Entry", "Away %", "TGT", "SL", "Status"]
+def style_status(value):
+    if value == "TGT Hit":
+        return "background-color: darkgreen; color: white; font-weight: bold;"
+    if value == "SL Hit":
+        return "background-color: #B71C1C; color: white; font-weight: bold;"
+    return ""
 CE_TINTS = {
     "Entry": {"background-color": "#E3F2FD", "color": "#0D47A1", "font-weight": "600"},
 }
@@ -943,6 +951,7 @@ def show_side_by_side(ce_table, pe_table):
             ce_style = (
                 ce_table[DISPLAY_COLS].style
                 .map(style_away_percent, subset=["Away %"])
+                .map(style_status, subset=["Status"])
                 .pipe(apply_column_tints, CE_TINTS)
                 .format(DECIMAL_COLS, na_rep="-")
             )
@@ -955,6 +964,7 @@ def show_side_by_side(ce_table, pe_table):
             pe_style = (
                 pe_table[DISPLAY_COLS].style
                 .map(style_away_percent, subset=["Away %"])
+                .map(style_status, subset=["Status"])
                 .pipe(apply_column_tints, PE_TINTS)
                 .format(DECIMAL_COLS, na_rep="-")
             )
