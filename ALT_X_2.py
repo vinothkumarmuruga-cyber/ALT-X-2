@@ -4,9 +4,9 @@ import numpy as np
 import requests
 import os
 import io
+import time
 import zipfile
 import json
-from urllib.parse import quote
 from datetime import date, datetime, timedelta, timezone
 # ============================================================
 # IST
@@ -70,31 +70,20 @@ if not os.path.exists(DATA_DIR):
 TOKEN_FILE = os.path.join(DATA_DIR, "token.json")
 TRIGGER_ALERT_FILE = os.path.join(DATA_DIR, "trigger_alert_state.json")
 LAST_LTP_FILE = os.path.join(DATA_DIR, "last_ltp_state.json")
+ENTRY_STATE_FILE = os.path.join(DATA_DIR, "entry_state.json")
 ALERT_LOG_FILE = os.path.join(DATA_DIR, "alert_log.csv")
 # ============================================================
 # OPTIONAL EXTERNAL PERSISTENCE (GitHub Gist)
 #
 # Local disk under DATA_DIR is NOT reliable on Streamlit Cloud — the
-# container (and everything on its filesystem) gets wiped on restarts,
-# redeploys, or after a period of inactivity. That means the Upstox
-# token and, worse, the Telegram alert-dedup state can silently reset
-# mid-day, causing duplicate alerts.
-#
-# If you add these two secrets in .streamlit/secrets.toml (or the
-# Streamlit Cloud secrets UI), the token and alert-dedup state are
-# additionally backed up to a private GitHub Gist, which survives
-# app restarts:
+# container gets wiped on restarts, redeploys, or after inactivity.
+# If you add these two secrets, token + alert/entry state are also
+# backed up to a private GitHub Gist and survive restarts:
 #
 #   GITHUB_GIST_TOKEN = "ghp_xxx..."   # PAT with the "gist" scope
-#   GITHUB_GIST_ID    = "abcdef123..."  # id of an existing (empty) gist
+#   GITHUB_GIST_ID    = "abcdef123..."  # id of an existing (secret) gist
 #
-# To create the gist: go to https://gist.github.com/, add any one
-# file (e.g. "placeholder.txt" with any content), save it as a
-# SECRET gist, then copy the id from its URL
-# (https://gist.github.com/<username>/<THIS PART>).
-#
-# Without these secrets set, everything falls back to local-disk-only
-# behavior exactly as before — nothing breaks if you skip this.
+# Without these secrets, everything falls back to local-disk-only.
 # ============================================================
 GIST_TOKEN = st.secrets.get("GITHUB_GIST_TOKEN", "")
 GIST_ID = st.secrets.get("GITHUB_GIST_ID", "")
@@ -105,8 +94,7 @@ def _gist_headers():
         "Accept": "application/vnd.github+json"
     }
 def _gist_read_file(filename):
-    """Returns the raw text content of one file inside the configured
-    Gist, or None if not configured / not found / on any error."""
+    """Raw text of one file inside the configured Gist, or None."""
     if not USE_GIST_PERSISTENCE:
         return None
     try:
@@ -122,9 +110,7 @@ def _gist_read_file(filename):
     except Exception:
         return None
 def _gist_write_file(filename, content_str):
-    """Writes (creates/overwrites) one file inside the configured Gist.
-    Returns True on success, False otherwise (including if not
-    configured) — callers should treat this as best-effort."""
+    """Best-effort write of one file inside the configured Gist."""
     if not USE_GIST_PERSISTENCE:
         return False
     try:
@@ -151,16 +137,12 @@ def load_token():
                     return data.get("token", "")
         except:
             pass
-    # Local copy missing/stale (likely a fresh container after a restart)
-    # — try the Gist backup before giving up.
     if USE_GIST_PERSISTENCE:
         raw = _gist_read_file("token.json")
         if raw:
             try:
                 data = json.loads(raw)
                 if data.get("date") == today_str:
-                    # Warm the local cache too, so we don't hit the Gist
-                    # API again this session.
                     try:
                         with open(TOKEN_FILE, "w") as f:
                             json.dump(data, f)
@@ -184,14 +166,7 @@ def save_token(token):
         _gist_write_file("token.json", json.dumps(data))
 # ============================================================
 # TELEGRAM TRIGGER-ALERT STATE
-#
-# Persisted to disk (and, if configured, to the Gist backup — see the
-# "OPTIONAL EXTERNAL PERSISTENCE" section above) so alert
-# de-duplication survives restarts. Without a durable backup, a
-# Streamlit Cloud restart mid-day wipes this file and can cause
-# duplicate Telegram alerts for options that already fired earlier.
-# Resets automatically each new trading day. Each entry is
-# "PDL:<symbol>".
+# De-duplicates alerts per trading day. Each entry is "PDL:<symbol>".
 # ============================================================
 def load_trigger_alert_state():
     today_str = get_ist_now().strftime("%Y-%m-%d")
@@ -203,8 +178,6 @@ def load_trigger_alert_state():
                     return set(data.get("keys", []))
         except:
             pass
-    # Local copy missing/stale — likely a fresh container after a
-    # restart. Try the Gist backup before falling back to empty.
     if USE_GIST_PERSISTENCE:
         raw = _gist_read_file("trigger_alert_state.json")
         if raw:
@@ -234,14 +207,11 @@ def save_trigger_alert_state(keys):
     if USE_GIST_PERSISTENCE:
         _gist_write_file("trigger_alert_state.json", json.dumps(data))
 # ============================================================
-# LAST-SEEN LTP STATE — the baseline check_and_alert_atl uses to detect a
-# genuine Entry CROSSOVER (previous LTP below Entry, current LTP at/above
-# it) instead of just "LTP happens to be >= Entry right now". Without this,
-# enabling Telegram alerts, restarting the app, or clicking "Reset Alerts"
-# while a contract is already sitting well past Entry (e.g. Away % 127%,
-# 192%) fires an immediate, stale-looking alert for a move that may have
-# happened hours earlier. Persisted (+ Gist-backed, same as the alert-dedup
-# state) and reset each new trading day. Each entry is "<symbol>": <ltp>.
+# LAST-SEEN LTP STATE — baseline used by check_and_alert to detect a
+# genuine Entry CROSSOVER (previous LTP below Entry, current LTP at/above).
+# Each entry is "<symbol>": <ltp>. Reset each trading day.
+# Gist writes are throttled (see check_and_alert) because this map covers
+# every scanned contract and changes on every refresh.
 # ============================================================
 def load_last_ltp_state():
     today_str = get_ist_now().strftime("%Y-%m-%d")
@@ -269,7 +239,7 @@ def load_last_ltp_state():
             except Exception:
                 pass
     return {}
-def save_last_ltp_state(ltp_map):
+def save_last_ltp_state(ltp_map, gist=True):
     data = {
         "date": get_ist_now().strftime("%Y-%m-%d"),
         "ltp": ltp_map
@@ -279,65 +249,61 @@ def save_last_ltp_state(ltp_map):
             json.dump(data, f)
     except:
         pass
-    if USE_GIST_PERSISTENCE:
+    if gist and USE_GIST_PERSISTENCE:
         _gist_write_file("last_ltp_state.json", json.dumps(data))
 # ============================================================
-# FIRST-HIT STATE — once a triggered contract's TGT or SL is hit, whichever
-# comes FIRST is frozen for the rest of the trading day (the other one is
-# ignored even if price later reaches it). Keyed by instrument_key,
-# persisted to disk (+ Gist backup if configured) so a restart doesn't
-# un-freeze it, and reset automatically each new trading day.
-# Each entry is "<instrument_key>": "TGT Hit" | "SL Hit".
+# ENTRY STATE — LTP-based, latched for the trading day.
+#
+# The moment a contract's LTP is seen at/above its Entry (PDL x2), it is
+# latched here as "Open" and stays listed for the rest of the day even if
+# LTP later falls back below Entry. From then on, the FIRST of these seen
+# on LTP wins and is frozen:
+#     LTP >= TGT  -> "TGT Hit"
+#     LTP <= SL   -> "SL Hit"
+# Keyed by instrument_key. Persisted (+ Gist backup), reset each new day.
+# Each entry is "<instrument_key>": "Open" | "TGT Hit" | "SL Hit".
 # ============================================================
-FIRST_HIT_FILE = os.path.join(DATA_DIR, "first_hit_state.json")
-def load_first_hit_state():
+def load_entry_state():
     today_str = get_ist_now().strftime("%Y-%m-%d")
-    if os.path.exists(FIRST_HIT_FILE):
+    if os.path.exists(ENTRY_STATE_FILE):
         try:
-            with open(FIRST_HIT_FILE, "r") as f:
+            with open(ENTRY_STATE_FILE, "r") as f:
                 data = json.load(f)
                 if data.get("date") == today_str:
-                    return dict(data.get("hits", {}))
+                    return dict(data.get("states", {}))
         except:
             pass
-    hits = {}
+    states = {}
     if USE_GIST_PERSISTENCE:
-        raw = _gist_read_file("first_hit_state.json")
+        raw = _gist_read_file("entry_state.json")
         if raw:
             try:
                 data = json.loads(raw)
                 if data.get("date") == today_str:
-                    hits = dict(data.get("hits", {}))
+                    states = dict(data.get("states", {}))
             except Exception:
                 pass
-    # Warm the local cache (even when empty) so the Gist isn't hit on
-    # every refresh.
+    # Warm local cache (even when empty) so the Gist isn't hit every refresh.
     try:
-        with open(FIRST_HIT_FILE, "w") as f:
-            json.dump({"date": today_str, "hits": hits}, f)
+        with open(ENTRY_STATE_FILE, "w") as f:
+            json.dump({"date": today_str, "states": states}, f)
     except:
         pass
-    return hits
-def save_first_hit_state(hits):
+    return states
+def save_entry_state(states):
     data = {
         "date": get_ist_now().strftime("%Y-%m-%d"),
-        "hits": hits
+        "states": states
     }
     try:
-        with open(FIRST_HIT_FILE, "w") as f:
+        with open(ENTRY_STATE_FILE, "w") as f:
             json.dump(data, f)
     except:
         pass
     if USE_GIST_PERSISTENCE:
-        _gist_write_file("first_hit_state.json", json.dumps(data))
+        _gist_write_file("entry_state.json", json.dumps(data))
 # ============================================================
-# ALERT LOG (CSV) — every fired PDL x2 alert gets one row here: when it
-# crossed, at what LTP, and what the Entry/TGT/SL levels were at that
-# moment. Lets you go back later and check whether price actually
-# reached TGT before SL, instead of trusting the fixed TGT/SL
-# percentages blind. Also mirrored to the Gist backup (if configured)
-# so the day's alert history isn't lost on a restart — see the
-# "OPTIONAL EXTERNAL PERSISTENCE" section above.
+# ALERT LOG (CSV) — every fired alert gets one row.
 # ============================================================
 ALERT_LOG_HEADER = "timestamp_ist,tab,symbol,ltp,trigger,tgt,sl\n"
 def log_alert_event(tab, symbol, ltp, trigger, tgt=None, sl=None):
@@ -417,13 +383,7 @@ def chunk_list(items, size=300):
     for i in range(0, len(items), size):
         yield items[i:i + size]
 def nearest_option(options_df, underlying_key, expiry, option_type, ref_price):
-    """
-    ref_price is the reference price the "nearest strike" is measured
-    against — sourced entirely from the uploaded NSE F&O Bhavcopy (see
-    parse_bhavcopy_underlying_prices below), so the selected CE/PE
-    strike is whatever the exchange's own end-of-day underlying price
-    says is nearest, not a live-computed open.
-    """
+    """Nearest strike to ref_price (Bhavcopy underlying price)."""
     chain = options_df[
         (options_df["underlying_key"] == underlying_key) &
         (options_df["expiry_date"] == expiry) &
@@ -452,26 +412,24 @@ def apply_column_tints(styler, tints):
 # ============================================================
 # PDL x2 SCANNER  (PDL = Previous Day Low)
 #
-#   PDL = the option contract's own LOW price from the uploaded NSE F&O
-#   Bhavcopy (UDiFF "LwPric" column; older layouts "LOW"), matched per
-#   contract on (symbol, expiry, strike, CE/PE).
+#   PDL   = the option contract's own LOW from the uploaded NSE F&O
+#           Bhavcopy (UDiFF "LwPric"; older layouts "LOW"), matched per
+#           contract on (symbol, expiry, strike, CE/PE).
 #
 #   Entry = PDL x ENTRY_MULT (2.0)
 #   TGT   = Entry x EXIT_MULT (1.5)   [ = PDL x 3.0 ]
 #   SL    = Entry x SL_MULT (0.5)     [ = PDL ]
-#   (all three multipliers live right here.)
 #
-#   Status (shown in the table):
-#     Not Triggered -> hidden (today's high hasn't reached Entry)
-#     Open          -> Entry reached, neither TGT nor SL hit yet
-#     TGT Hit / SL Hit -> whichever of TGT / SL was hit FIRST after Entry
-#                     was reached. It is FROZEN for the day: once set it
-#                     never changes, even if the other level is touched
-#                     later. Order is read from today's 1-minute candles
-#                     (only fetched when today's high/low says a hit is
-#                     possible); a minute that spans both TGT and SL is
-#                     counted as SL first. Frozen hits are persisted
-#                     (see FIRST-HIT STATE above).
+#   ALL LEVELS ARE CHECKED AGAINST LTP (not the day's high/low):
+#     Not Triggered -> hidden (LTP has not been at/above Entry yet today)
+#     Open          -> LTP crossed Entry at some refresh (latched for the
+#                      day, so the row stays even if LTP dips back below
+#                      Entry); neither TGT nor SL hit yet
+#     TGT Hit / SL Hit -> first of LTP >= TGT / LTP <= SL seen after the
+#                      entry latch. FROZEN for the day (persisted).
+#
+#   Because it is LTP-based, a spike that happens and reverses BETWEEN two
+#   refreshes is not seen. Use a shorter refresh interval to tighten this.
 # ============================================================
 ENTRY_MULT = 2.0   # Entry = PDL * ENTRY_MULT
 EXIT_MULT = 1.5    # TGT   = Entry * EXIT_MULT
@@ -518,7 +476,7 @@ def _parse_bhavcopy_bytes(name, raw_bytes):
     symbol_col = next((c for c in ["TckrSymb", "SYMBOL", "Symbol"] if c in df.columns), None)
     if symbol_col is None:
         return {}, {}, None, "Bhavcopy is missing a symbol column (expected TckrSymb / SYMBOL)."
-    # ---------- strike-selection reference price (unchanged) ----------
+    # ---------- strike-selection reference price ----------
     price_col = next((c for c in ["UndrlygPric", "UNDRLYPRC", "UnderlyingPrice"] if c in df.columns), None)
     if price_col is not None:
         work_df = df
@@ -574,12 +532,7 @@ def parse_bhavcopy(uploaded_file):
         return {}, {}, None, None
     return _parse_bhavcopy_bytes(uploaded_file.name, uploaded_file.getvalue())
 def render_bhavcopy_uploader(container):
-    """
-    Renders the Bhavcopy uploader + status message in the given
-    Streamlit container and returns (price_map, low_map, bhav_date).
-    The Bhavcopy is REQUIRED: it supplies both the strike-selection
-    reference price and each option's Low price (Entry = Low x 2).
-    """
+    """Bhavcopy uploader + status. Returns (price_map, low_map, bhav_date)."""
     container.markdown("**Bhavcopy (Strike Ref + Low) — required**")
     bhavcopy_file = container.file_uploader(
         "Upload NSE F&O Bhavcopy",
@@ -605,11 +558,8 @@ def render_bhavcopy_uploader(container):
         container.warning("No Bhavcopy uploaded yet — required.")
     return price_map, low_map, bhav_date
 def fetch_today_live_ohlc(instrument_keys, headers):
-    """
-    Today's still-forming daily candle (running high/low) plus LTP.
-    One batched call across all instruments via Upstox's v3 OHLC
-    endpoint, extracting high/low/last_price.
-    """
+    """LTP (plus running high/low, unused for status) for all instruments
+    via Upstox's v3 OHLC endpoint, batched."""
     url = "https://api.upstox.com/v3/market-quote/ohlc"
     rows = []
     for keys in chunk_list(instrument_keys):
@@ -636,112 +586,65 @@ def fetch_today_live_ohlc(instrument_keys, headers):
                 "today_ltp": item.get("last_price"),
             })
     return pd.DataFrame(rows, columns=["instrument_key", "today_high", "today_low", "today_ltp"])
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_intraday_candles(instrument_key, headers_tuple):
-    """Today's 1-minute candles for one instrument, oldest -> newest.
-    Returns None on any failure / empty response. Cached 60s so contracts
-    that are waiting on a hit aren't re-fetched every refresh."""
-    headers = dict(headers_tuple)
-    url = (
-        "https://api.upstox.com/v3/historical-candle/intraday/"
-        f"{quote(instrument_key, safe='')}/minutes/1"
-    )
-    try:
-        response = requests.get(url, headers=headers, timeout=20)
-    except requests.RequestException:
-        return None
-    if response.status_code != 200:
-        return None
-    try:
-        candles = (response.json().get("data") or {}).get("candles") or []
-    except Exception:
-        return None
-    if not candles:
-        return None
-    df = pd.DataFrame(
-        candles,
-        columns=["timestamp", "open", "high", "low", "close", "volume", "oi"],
-    )
-    for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.dropna(subset=["high", "low"]).sort_values("timestamp").reset_index(drop=True)
-    return df if not df.empty else None
-def first_hit_from_candles(candles, entry, tgt, sl):
-    """After Entry is first reached, which of TGT / SL comes first?
-    Returns "TGT Hit", "SL Hit" or None (neither yet). SL is only
-    checked from the candle AFTER the entry candle (order inside the
-    entry minute is unknown, so a low in that minute can't be trusted as
-    post-entry); a later minute spanning both TGT and SL counts as SL."""
-    entered = False
-    for row in candles.itertuples():
-        if not entered:
-            if row.high >= entry:
-                entered = True
-                if row.high >= tgt:
-                    return "TGT Hit"
-            continue
-        if row.low <= sl:
-            return "SL Hit"
-        if row.high >= tgt:
-            return "TGT Hit"
-    return None
-def resolve_statuses(selected, headers):
-    """Status for every row of `selected`: Not Triggered / Open /
-    TGT Hit / SL Hit. TGT Hit / SL Hit are FROZEN (first hit only) via
-    the persisted first-hit state, keyed by instrument_key."""
-    headers_tuple = tuple(headers.items())
-    hits = load_first_hit_state()
-    hits_changed = False
+def resolve_statuses(selected):
+    """
+    LTP-based status for every row of `selected` (needs Entry/TGT/SL/LTP
+    columns and option_key):
+      - already TGT Hit / SL Hit  -> frozen, returned as-is
+      - already latched Open      -> TGT Hit if LTP >= TGT, SL Hit if LTP <= SL,
+                                     else Open
+      - not yet latched           -> latches to Open the first time
+                                     LTP >= Entry (then TGT check applies
+                                     immediately); otherwise Not Triggered
+    State is persisted keyed by instrument_key, reset each trading day.
+    """
+    states = load_entry_state()
+    changed = False
     statuses = []
     for _, row in selected.iterrows():
         key = row["option_key"]
-        if key in hits:
-            statuses.append(hits[key])
+        state = states.get(key)
+        if state in ("TGT Hit", "SL Hit"):
+            statuses.append(state)
             continue
-        entry, tgt, sl = row["Entry"], row["TGT"], row["SL"]
-        hi, lo = row.get("today_high"), row.get("today_low")
-        if pd.isna(entry) or pd.isna(hi) or hi < entry:
-            statuses.append("Not Triggered")
+        entry, tgt, sl, ltp = row["Entry"], row["TGT"], row["SL"], row["LTP"]
+        if pd.isna(ltp) or pd.isna(entry):
+            # No quote this refresh: keep whatever is already latched.
+            statuses.append(state if state else "Not Triggered")
             continue
-        status = "Open"
-        hit_tgt = hi >= tgt
-        hit_sl = pd.notna(lo) and lo <= sl
-        if hit_tgt or hit_sl:
-            candles = fetch_intraday_candles(key, headers_tuple)
-            if candles is not None:
-                res = first_hit_from_candles(candles, entry, tgt, sl)
-                if res:
-                    status = res
-            elif hit_tgt and not hit_sl:
-                status = "TGT Hit"   # unambiguous even without candles
-            # else: order unknown and candles unavailable -> stay Open, retry next refresh
-        if status in ("TGT Hit", "SL Hit"):
-            hits[key] = status
-            hits_changed = True
-        statuses.append(status)
-    if hits_changed:
-        save_first_hit_state(hits)
+        if state is None:
+            if ltp >= entry:
+                state = "Open"
+                states[key] = "Open"
+                changed = True
+            else:
+                statuses.append("Not Triggered")
+                continue
+        # state == "Open" from here
+        if ltp >= tgt:
+            state = "TGT Hit"
+        elif ltp <= sl:
+            state = "SL Hit"
+        if state in ("TGT Hit", "SL Hit"):
+            states[key] = state
+            changed = True
+        statuses.append(state)
+    if changed:
+        save_entry_state(states)
     return statuses
 def check_and_alert(df, telegram_enabled, bot_token, chat_id):
     """
-    PDL x2 scanner: alerts a symbol only on a genuine FRESH CROSSOVER
-    of its Entry level — the previously-seen LTP was below Entry and the
-    current LTP is at/above it. Checked fresh every refresh off the
-    current quote, not off the Status column.
+    Alerts a symbol only on a genuine FRESH CROSSOVER of its Entry level —
+    previously-seen LTP below Entry, current LTP at/above it.
 
-    Requiring an actual prev-below / now-above edge (via
-    load_last_ltp_state / save_last_ltp_state) — rather than simply
-    "LTP >= Entry right now" — avoids a stale-looking alert firing the
-    moment Telegram gets enabled, the app restarts, or "Reset Alerts" is
-    clicked while price is already sitting well past Entry. On the first
-    observation of a symbol in a session/day there is no prior LTP to
-    compare against, so that refresh only seeds the baseline and never
-    fires an alert by itself.
+    `df` must be EVERY scanned contract (not just the ones already shown),
+    otherwise a contract has no below-Entry baseline until after it has
+    already crossed and the crossing would never alert.
 
-    Still de-duplicated per calendar day via the persisted alert-state
-    file (tagged "PDL:<symbol>", reset automatically each trading day)
-    on top of the crossover check.
+    The first observation of a symbol in a day only seeds the baseline and
+    never fires by itself, so enabling Telegram / restarting / "Reset
+    Alerts" while price is already above Entry does not send a stale
+    alert. De-duplicated per day via the persisted alert-state file.
     """
     if not telegram_enabled:
         return
@@ -760,17 +663,23 @@ def check_and_alert(df, telegram_enabled, bot_token, chat_id):
             continue
         prev_ltp = last_ltp.get(symbol)
         if prev_ltp != ltp:
-            last_ltp[symbol] = ltp
+            last_ltp[symbol] = float(ltp)
             ltp_state_changed = True
         if prev_ltp is None or prev_ltp >= entry:
-            continue  # no prior below-Entry baseline to cross FROM this refresh
+            continue  # no prior below-Entry baseline to cross FROM
         if ltp < entry:
             continue  # hasn't crossed yet
         alert_id = f"PDL:{symbol}"
         if alert_id not in alerted:
             newly_triggered.append((alert_id, row))
     if ltp_state_changed:
-        save_last_ltp_state(last_ltp)
+        # Local write every refresh; Gist at most once a minute (or right
+        # when an alert is about to go out).
+        now_ts = time.time()
+        gist_due = bool(newly_triggered) or (now_ts - st.session_state.get("_ltp_gist_ts", 0) >= 60)
+        if gist_due:
+            st.session_state["_ltp_gist_ts"] = now_ts
+        save_last_ltp_state(last_ltp, gist=gist_due)
     if not newly_triggered:
         return
     sent_count = 0
@@ -799,6 +708,10 @@ def check_and_alert(df, telegram_enabled, bot_token, chat_id):
     if fail_count:
         st.toast(f"{fail_count} alert(s) failed — will retry next refresh.", icon="⚠️")
 def build_scanner(access_token, expiry_choice, bhavcopy_price_map, bhavcopy_low_map):
+    """Returns (ce_table, pe_table, all_df).
+    ce/pe tables = only contracts latched as triggered (LTP crossed Entry).
+    all_df = every scanned contract (used for crossover alerts)."""
+    empty = pd.DataFrame()
     headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {access_token}"
@@ -807,19 +720,18 @@ def build_scanner(access_token, expiry_choice, bhavcopy_price_map, bhavcopy_low_
     expiry = get_expiry_for_choice(futures, expiry_choice)
     if expiry is None:
         st.error("No futures expiry found")
-        return pd.DataFrame(), pd.DataFrame()
+        return empty, empty, empty
     futures = futures[futures["expiry_date"] == expiry].copy()
     options = options[options["expiry_date"] == expiry].copy()
     if not bhavcopy_price_map or not bhavcopy_low_map:
         st.error("Upload an NSE F&O Bhavcopy in the sidebar first — strike selection and the Low x2 Entry both come from it.")
-        return pd.DataFrame(), pd.DataFrame()
-    # Strike selection reference price: uploaded Bhavcopy only.
+        return empty, empty, empty
     futures["future_open"] = futures["underlying_symbol"].map(bhavcopy_price_map)
     dropped = futures[futures["future_open"].isna()]["underlying_symbol"].unique().tolist()
     futures = futures.dropna(subset=["future_open"])
     if futures.empty:
         st.error("None of this expiry's underlyings were found in the uploaded Bhavcopy.")
-        return pd.DataFrame(), pd.DataFrame()
+        return empty, empty, empty
     if dropped:
         with st.expander(f"⚠️ {len(dropped)} underlying(s) skipped — not found in the uploaded Bhavcopy"):
             st.write(", ".join(sorted(dropped)))
@@ -840,7 +752,7 @@ def build_scanner(access_token, expiry_choice, bhavcopy_price_map, bhavcopy_low_
     selected = pd.DataFrame(selected_rows)
     if selected.empty:
         st.error("No CE/PE options found")
-        return pd.DataFrame(), pd.DataFrame()
+        return empty, empty, empty
     selected["Symbol"] = (
         selected["underlying_symbol"].astype(str) + " "
         + selected["strike"].astype(int).astype(str) + " "
@@ -875,25 +787,20 @@ def build_scanner(access_token, expiry_choice, bhavcopy_price_map, bhavcopy_low_
     # Drop missing + penny lows BEFORE hitting the live quote API.
     selected = selected[selected["PDL"] >= MIN_LOW].reset_index(drop=True)
     if selected.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return empty, empty, empty
     selected["Entry"] = selected["PDL"] * ENTRY_MULT
     selected["TGT"] = selected["Entry"] * EXIT_MULT
     selected["SL"] = selected["Entry"] * SL_MULT
-    # Not our setup: Entry (PDL x2) was already touched on the PDL day
-    # itself (that day's HIGH >= Entry). Only contracts whose Entry is
-    # first reached AFTER the PDL day qualify, so drop these before the
-    # live quote call.
-    same_day = selected["PDL High"] >= selected["Entry"]
-    if same_day.any():
-        with st.expander(f"ℹ️ {int(same_day.sum())} option(s) skipped — Entry already hit on the PDL day itself"):
-            st.write(", ".join(selected.loc[same_day, "Symbol"].tolist()[:50]))
-    selected = selected[~same_day].reset_index(drop=True)
+    # Entry (PDL x2) already touched on the PDL day itself (that day's
+    # HIGH >= Entry) is not this setup — drop before the live quote call.
+
     if selected.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return empty, empty, empty
     live_ohlc = fetch_today_live_ohlc(selected["option_key"].tolist(), headers)
     selected = selected.merge(live_ohlc, left_on="option_key", right_on="instrument_key", how="left")
-    selected["Status"] = resolve_statuses(selected, headers)
     selected["LTP"] = pd.to_numeric(selected["today_ltp"], errors="coerce")
+    if selected["LTP"].isna().all():
+        st.warning("No live quotes returned — check the Upstox access token / market hours.")
     selected["Away %"] = np.where(
         selected["Entry"] > 0,
         (selected["LTP"] / selected["Entry"]) * 100,
@@ -901,8 +808,7 @@ def build_scanner(access_token, expiry_choice, bhavcopy_price_map, bhavcopy_low_
     )
     selected["Away %"] = selected["Away %"].clip(lower=0)
     selected["Cap"] = selected["LTP"] * selected["Lot"]
-    # Lot and Cap stay in `result` for the Telegram message + alert log
-    # even though they are not shown in the table (DISPLAY_COLS below).
+    selected["Status"] = resolve_statuses(selected)
     result = selected[[
         "Symbol", "LTP", "PDL", "Entry", "Away %", "TGT", "SL",
         "Status", "Lot", "Cap"
@@ -911,11 +817,13 @@ def build_scanner(access_token, expiry_choice, bhavcopy_price_map, bhavcopy_low_
         result[col] = pd.to_numeric(result[col], errors="coerce").round(2)
     result["Lot"] = pd.to_numeric(result["Lot"], errors="coerce").fillna(0).astype(int)
     result["Cap"] = pd.to_numeric(result["Cap"], errors="coerce").round(0).fillna(0).astype(int)
-    # Only contracts whose Entry has actually been reached today.
-    result = result[result["Status"] != "Not Triggered"].reset_index(drop=True)
-    ce_table = result[result["Symbol"].str.endswith("CE")].sort_values("Away %", ascending=False, na_position="last").reset_index(drop=True)
-    pe_table = result[result["Symbol"].str.endswith("PE")].sort_values("Away %", ascending=False, na_position="last").reset_index(drop=True)
-    return ce_table, pe_table
+    # Full set (pre-filter) is what the alert crossover check runs on.
+    all_df = result.copy()
+    # Table: only contracts whose LTP has crossed Entry today.
+    shown = result[result["Status"] != "Not Triggered"].reset_index(drop=True)
+    ce_table = shown[shown["Symbol"].str.endswith("CE")].sort_values("Away %", ascending=False, na_position="last").reset_index(drop=True)
+    pe_table = shown[shown["Symbol"].str.endswith("PE")].sort_values("Away %", ascending=False, na_position="last").reset_index(drop=True)
+    return ce_table, pe_table, all_df
 DECIMAL_COLS = {
     "LTP": "{:.2f}",
     "PDL": "{:.2f}",
@@ -924,8 +832,7 @@ DECIMAL_COLS = {
     "TGT": "{:.2f}",
     "SL": "{:.2f}",
 }
-# Lot and Cap are kept out of the display (still on the DataFrame for the
-# Telegram alert / log).
+# Lot and Cap stay on the DataFrame for the Telegram alert / log only.
 DISPLAY_COLS = ["Symbol", "LTP", "PDL", "Entry", "Away %", "TGT", "SL", "Status"]
 def style_status(value):
     if value == "TGT Hit":
@@ -986,8 +893,6 @@ if is_client_view:
     telegram_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
     telegram_enabled = bool(telegram_bot_token and telegram_chat_id)
-    # Sidebar is hidden in client view, but the Bhavcopy upload is
-    # required, so it is rendered in the main body above the title.
     bhavcopy_price_map, bhavcopy_low_map, bhavcopy_date = render_bhavcopy_uploader(st)
     st.markdown("---")
 else:
@@ -1018,7 +923,7 @@ else:
             "Enable Trigger Alerts",
             value=st.session_state.get("telegram_enabled", False),
             key="telegram_enabled",
-            help="Sends a Telegram message the moment an option's PDL x2 Entry level is crossed for the first time today."
+            help="Sends a Telegram message the moment an option's LTP crosses its PDL x2 Entry level."
         )
         telegram_bot_token = st.text_input(
             "Bot Token",
@@ -1055,9 +960,9 @@ else:
         auto_refresh = st.checkbox("Enable Auto-Refresh", value=False)
         refresh_interval = st.slider("Refresh Interval (seconds)", min_value=5, max_value=60, value=15)
 # ============================================================
-# MAIN PAGE — single live scanner:
+# MAIN PAGE — single live scanner (all levels LTP-based):
 #   PDL x2: Entry = Bhavcopy option LOW x2.0,
-#                TGT = Entry x2.0, SL = Entry x0.5
+#           TGT = Entry x1.5, SL = Entry x0.5
 # ============================================================
 st.title("PDL x2 Scanner")
 run_every = refresh_interval if auto_refresh else None
@@ -1067,18 +972,18 @@ else:
     st.header("PDL x2 Breakout (Live)")
     st.caption(
         f"Entry = PDL x{ENTRY_MULT:g}  |  TGT = Entry x{EXIT_MULT:g}  |  SL = Entry x{SL_MULT:g}"
+        "  |  Shown once LTP ≥ Entry"
         + (f"  |  Bhavcopy date: {bhavcopy_date}" if bhavcopy_date else "")
     )
     @st.fragment(run_every=run_every)
     def show_scanner():
-        ce_table, pe_table = build_scanner(
+        ce_table, pe_table, all_df = build_scanner(
             access_token, expiry_type, bhavcopy_price_map, bhavcopy_low_map
         )
+        if telegram_enabled and not all_df.empty:
+            check_and_alert(all_df, telegram_enabled, telegram_bot_token, telegram_chat_id)
         if not ce_table.empty or not pe_table.empty:
-            if telegram_enabled:
-                combined = pd.concat([ce_table, pe_table], ignore_index=True)
-                check_and_alert(combined, telegram_enabled, telegram_bot_token, telegram_chat_id)
             show_side_by_side(ce_table, pe_table)
         else:
-            st.info("No triggered entries yet — waiting for market data or a breakout above Entry.")
+            st.info("No triggered entries yet — waiting for market data or an LTP crossing above Entry.")
     show_scanner()
