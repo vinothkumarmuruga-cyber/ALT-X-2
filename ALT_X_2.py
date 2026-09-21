@@ -544,10 +544,6 @@ def _fetch_single_atl_data(instrument_key, headers, from_date, to_date, max_retr
         # displays with a time-of-day and +05:30 offset (e.g.
         # "2026-08-10 00:00:00+05:30") instead of just "2026-08-10".
         "atl_date": atl_timestamp.strftime("%Y-%m-%d") if pd.notna(atl_timestamp) else None,
-        # Date of the newest completed daily candle in the window ("yesterday"
-        # = last trading session). Used to keep only strikes whose ATL was
-        # formed on that session.
-        "last_date": candles["timestamp"].iloc[-1].strftime("%Y-%m-%d"),
         "entry": entry,
         "tgt": tgt,
         "sl": sl,
@@ -841,7 +837,7 @@ def render_bhavcopy_uploader(container):
     else:
         container.warning("No Bhavcopy uploaded yet — required for strike selection.")
     return price_map
-def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_map=None, only_yesterday_atl=True):
+def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_map=None):
     headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {access_token}"
@@ -922,20 +918,6 @@ def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_ma
             if atl_errors:
                 for err in atl_errors:
                     st.code(err)
-    # ---- "ATL formed yesterday" filter ----
-    # Keep only strikes whose all-time low (lowest low in the look-back
-    # window) was set on the LAST COMPLETED trading session — i.e. a fresh
-    # ATL made yesterday. "Yesterday" is the newest daily candle available
-    # across the scanned contracts, so on a Monday it is Friday.
-    if only_yesterday_atl:
-        session_dates = [info["last_date"] for info in atl_map.values() if info and info.get("last_date")]
-        if not session_dates:
-            return pd.DataFrame(), pd.DataFrame()
-        last_session = max(session_dates)
-        selected = selected[selected["ATL Date"] == last_session].reset_index(drop=True)
-        st.caption(f"Showing strikes that formed a new ATL on the last session ({last_session}): {len(selected)}")
-        if selected.empty:
-            return pd.DataFrame(), pd.DataFrame()
     live_ohlc = fetch_today_live_ohlc(selected["option_key"].tolist(), headers)
     selected = selected.merge(live_ohlc, left_on="option_key", right_on="instrument_key", how="left")
     selected["Status"] = selected.apply(_resolve_atl_status, axis=1)
@@ -963,12 +945,7 @@ def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_ma
     # within the look-back window, or live today — not a watchlist of every
     # ATM strike. Status itself stays internal (used here for the filter and
     # for the Telegram alert) and is not rendered as a table column.
-    # With the yesterday-ATL filter on, every remaining strike is shown
-    # (a fresh ATL is normally still below Entry, so requiring "triggered"
-    # would hide exactly the strikes being watched); Away % shows how close
-    # each one is to Entry and the Telegram alert fires on the crossing.
-    if not only_yesterday_atl:
-        result = result[result["Status"] != "Not Triggered"].reset_index(drop=True)
+    result = result[result["Status"] != "Not Triggered"].reset_index(drop=True)
     # Drop options whose ATL is a "penny" price below MIN_ATL rupees — these
     # are typically deep OTM/illiquid strikes where the ATL x2/x4 levels are
     # not meaningful trade levels.
@@ -1037,7 +1014,6 @@ if is_client_view:
     refresh_interval = 15
     expiry_type = "Current Month"
     atl_start_date = get_ist_now().date() - timedelta(days=365)
-    only_yesterday_atl = True
     telegram_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
     telegram_enabled = bool(telegram_bot_token and telegram_chat_id)
@@ -1101,15 +1077,6 @@ else:
                 "SL = Entry x 0.5."
             )
         )
-        only_yesterday_atl = st.checkbox(
-            "Only strikes with ATL formed yesterday",
-            value=True,
-            help=(
-                "Show only strikes whose all-time low (lowest low in the "
-                "look-back window) was set on the last completed trading "
-                "session. Untick to see every triggered strike again."
-            )
-        )
         st.markdown("---")
         st.header("Telegram Alerts")
         telegram_enabled = st.checkbox(
@@ -1163,11 +1130,11 @@ if not access_token:
     st.warning("Enter your Upstox Access Token in the sidebar first.")
 else:
     st.header("All-Time-Low x2 Breakout (Live)")
-    st.caption(f"Entry = ATL x{ENTRY_MULT:g}  |  TGT = Entry x{EXIT_MULT:g}  |  SL = Entry x{SL_MULT:g}  |  Look-back from {atl_start_date}" + ("  |  ATL formed yesterday only" if only_yesterday_atl else ""))
+    st.caption(f"Entry = ATL x{ENTRY_MULT:g}  |  TGT = Entry x{EXIT_MULT:g}  |  SL = Entry x{SL_MULT:g}  |  Look-back from {atl_start_date}")
     @st.fragment(run_every=run_every)
     def show_atl():
         ce_table, pe_table = build_atl_scanner(
-            access_token, expiry_type, atl_start_date, bhavcopy_price_map, only_yesterday_atl
+            access_token, expiry_type, atl_start_date, bhavcopy_price_map
         )
         if not ce_table.empty or not pe_table.empty:
             if telegram_enabled:
@@ -1175,5 +1142,5 @@ else:
                 check_and_alert_atl(combined, telegram_enabled, telegram_bot_token, telegram_chat_id)
             show_atl_side_by_side(ce_table, pe_table)
         else:
-            st.info("No strikes to show — no ATL formed on the last session, or waiting for market data." if only_yesterday_atl else "No triggered entries yet — waiting for market data or a breakout above Entry.")
+            st.info("No triggered entries yet — waiting for market data or a breakout above Entry.")
     show_atl()
