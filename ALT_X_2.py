@@ -70,6 +70,7 @@ if not os.path.exists(DATA_DIR):
 TOKEN_FILE = os.path.join(DATA_DIR, "token.json")
 TRIGGER_ALERT_FILE = os.path.join(DATA_DIR, "trigger_alert_state.json")
 LAST_LTP_FILE = os.path.join(DATA_DIR, "last_ltp_state.json")
+ENTRY_STATE_FILE = os.path.join(DATA_DIR, "entry_state.json")
 ALERT_LOG_FILE = os.path.join(DATA_DIR, "alert_log.csv")
 # ============================================================
 # OPTIONAL EXTERNAL PERSISTENCE (GitHub Gist)
@@ -247,6 +248,51 @@ def save_last_ltp_state(ltp_map, gist=True):
     if gist and USE_GIST_PERSISTENCE:
         _gist_write_file("last_ltp_state.json", json.dumps(data))
 # ============================================================
+# ENTRY STATE — LTP-based, latched for the trading day.
+# The first refresh where LTP >= Trigger, the contract is latched "Open".
+# After that, the FIRST of LTP >= TGT ("TGT Hit") or LTP <= SL ("SL Hit")
+# is frozen for the rest of the day. Keyed by instrument_key, persisted
+# (+ Gist backup), reset each new trading day.
+# ============================================================
+def load_entry_state():
+    today_str = get_ist_now().strftime("%Y-%m-%d")
+    if os.path.exists(ENTRY_STATE_FILE):
+        try:
+            with open(ENTRY_STATE_FILE, "r") as f:
+                data = json.load(f)
+                if data.get("date") == today_str:
+                    return dict(data.get("states", {}))
+        except:
+            pass
+    states = {}
+    if USE_GIST_PERSISTENCE:
+        raw = _gist_read_file("entry_state.json")
+        if raw:
+            try:
+                data = json.loads(raw)
+                if data.get("date") == today_str:
+                    states = dict(data.get("states", {}))
+            except Exception:
+                pass
+    try:
+        with open(ENTRY_STATE_FILE, "w") as f:
+            json.dump({"date": today_str, "states": states}, f)
+    except:
+        pass
+    return states
+def save_entry_state(states):
+    data = {
+        "date": get_ist_now().strftime("%Y-%m-%d"),
+        "states": states
+    }
+    try:
+        with open(ENTRY_STATE_FILE, "w") as f:
+            json.dump(data, f)
+    except:
+        pass
+    if USE_GIST_PERSISTENCE:
+        _gist_write_file("entry_state.json", json.dumps(data))
+# ============================================================
 # ALERT LOG (CSV) — one row per fired alert.
 # ============================================================
 ALERT_LOG_HEADER = "timestamp_ist,tab,symbol,ltp,trigger,tgt,sl\n"
@@ -357,6 +403,10 @@ def style_change_percent(value):
 #             contract on (symbol, expiry, strike, CE/PE).
 #   Trigger = PDL x ENTRY_MULT (2.0)
 #   Change% = LTP / Trigger x 100   (>= 100 means LTP is at/above Trigger)
+#   TGT     = Trigger x (1 + Target% / 100)   (sidebar input, default 50)
+#   SL      = Trigger x (1 - SL% / 100)       (sidebar input, default 50)
+#   Status  = LTP-based: Not Triggered -> Open (LTP >= Trigger, latched for
+#             the day) -> TGT Hit / SL Hit (first one seen, frozen for the day)
 #
 #   Every scanned contract is shown (sorted by Change %), except:
 #     - no PDL in the Bhavcopy
@@ -368,6 +418,8 @@ def style_change_percent(value):
 #   refresh at/above). Once per contract per day.
 # ============================================================
 ENTRY_MULT = 2.0   # Trigger = PDL * ENTRY_MULT
+DEFAULT_TGT_PCT = 50.0  # TGT = Trigger * (1 + pct/100)
+DEFAULT_SL_PCT = 50.0   # SL  = Trigger * (1 - pct/100)
 MIN_LOW = 3.0      # PDL below this (rupees) is dropped. Set to 0 to keep penny options.
 def _parse_expiry_series(s):
     s = s.astype(str).str.strip()
@@ -509,6 +561,40 @@ def fetch_live_ltp(instrument_keys, headers):
                 "today_ltp": item.get("last_price"),
             })
     return pd.DataFrame(rows, columns=["instrument_key", "today_ltp"])
+def resolve_statuses(selected):
+    """LTP-based Status per row (needs option_key, Trigger, TGT, SL, LTP)."""
+    states = load_entry_state()
+    changed = False
+    statuses = []
+    for _, row in selected.iterrows():
+        key = row["option_key"]
+        state = states.get(key)
+        if state in ("TGT Hit", "SL Hit"):
+            statuses.append(state)
+            continue
+        trigger, tgt, sl, ltp = row["Trigger"], row["TGT"], row["SL"], row["LTP"]
+        if pd.isna(ltp) or pd.isna(trigger):
+            statuses.append(state if state else "Not Triggered")
+            continue
+        if state is None:
+            if ltp >= trigger:
+                state = "Open"
+                states[key] = "Open"
+                changed = True
+            else:
+                statuses.append("Not Triggered")
+                continue
+        if ltp >= tgt:
+            state = "TGT Hit"
+        elif ltp <= sl:
+            state = "SL Hit"
+        if state in ("TGT Hit", "SL Hit"):
+            states[key] = state
+            changed = True
+        statuses.append(state)
+    if changed:
+        save_entry_state(states)
+    return statuses
 def check_and_alert(df, telegram_enabled, bot_token, chat_id):
     """
     Alerts a contract only on a genuine FRESH CROSSOVER of its Trigger —
@@ -562,6 +648,7 @@ def check_and_alert(df, telegram_enabled, bot_token, chat_id):
             f"LTP: {row['LTP']:.2f}\n"
             f"PDL: {row['PDL']:.2f}\n"
             f"Trigger: {row['Trigger']:.2f}\n"
+            f"TGT: {row['TGT']:.2f}  |  SL: {row['SL']:.2f}\n"
             f"Change %: {row['Change %']:.2f}%\n"
             f"Lot: {row['Lot']}  |  Cap: {row['Cap']}"
         )
@@ -569,7 +656,7 @@ def check_and_alert(df, telegram_enabled, bot_token, chat_id):
         if success:
             alerted.add(alert_id)
             save_trigger_alert_state(alerted)
-            log_alert_event("PDL", row['Contract'], row['LTP'], row['Trigger'])
+            log_alert_event("PDL", row['Contract'], row['LTP'], row['Trigger'], tgt=row['TGT'], sl=row['SL'])
             sent_count += 1
         else:
             fail_count += 1
@@ -577,7 +664,7 @@ def check_and_alert(df, telegram_enabled, bot_token, chat_id):
         st.toast(f"Telegram alert sent for {sent_count} trigger(s).", icon="🚀")
     if fail_count:
         st.toast(f"{fail_count} alert(s) failed — will retry next refresh.", icon="⚠️")
-def build_scanner(access_token, expiry_choice, bhavcopy_price_map, bhavcopy_low_map):
+def build_scanner(access_token, expiry_choice, bhavcopy_price_map, bhavcopy_low_map, tgt_pct, sl_pct):
     """Returns (ce_table, pe_table, all_df). Tables hold every scanned
     contract sorted by Change % (desc); all_df is used for alerts."""
     empty = pd.DataFrame()
@@ -657,6 +744,8 @@ def build_scanner(access_token, expiry_choice, bhavcopy_price_map, bhavcopy_low_
     if selected.empty:
         return empty, empty, empty
     selected["Trigger"] = selected["PDL"] * ENTRY_MULT
+    selected["TGT"] = selected["Trigger"] * (1 + tgt_pct / 100.0)
+    selected["SL"] = selected["Trigger"] * (1 - sl_pct / 100.0)
     # Trigger already reached on the PDL day itself (that day's HIGH >=
     # Trigger) -> remove the strike (silently).
     same_day = selected["PDL High"] >= selected["Trigger"]
@@ -675,6 +764,7 @@ def build_scanner(access_token, expiry_choice, bhavcopy_price_map, bhavcopy_low_
     )
     selected["Change %"] = selected["Change %"].clip(lower=0)
     selected["Cap"] = selected["LTP"] * selected["Lot"]
+    selected["Status"] = resolve_statuses(selected)
     result = pd.DataFrame({
         "Contract": selected["Contract"],
         "Symbol": selected["underlying_symbol"],
@@ -684,10 +774,13 @@ def build_scanner(access_token, expiry_choice, bhavcopy_price_map, bhavcopy_low_
         "Trigger": selected["Trigger"],
         "LTP": selected["LTP"],
         "Change %": selected["Change %"],
+        "TGT": selected["TGT"],
+        "SL": selected["SL"],
+        "Status": selected["Status"],
         "Lot": pd.to_numeric(selected["Lot"], errors="coerce").fillna(0).astype(int),
         "Cap": pd.to_numeric(selected["Cap"], errors="coerce").round(0).fillna(0).astype(int),
     })
-    for col in ["PDL", "Trigger", "LTP", "Change %"]:
+    for col in ["PDL", "Trigger", "LTP", "Change %", "TGT", "SL"]:
         result[col] = pd.to_numeric(result[col], errors="coerce").round(2)
     ce_table = result[result["Type"] == "CE"].sort_values("Change %", ascending=False, na_position="last").reset_index(drop=True)
     pe_table = result[result["Type"] == "PE"].sort_values("Change %", ascending=False, na_position="last").reset_index(drop=True)
@@ -697,8 +790,18 @@ DECIMAL_COLS = {
     "Trigger": "{:.2f}",
     "LTP": "{:.2f}",
     "Change %": "{:.2f}%",
+    "TGT": "{:.2f}",
+    "SL": "{:.2f}",
 }
-DISPLAY_COLS = ["Symbol", "Strike", "Trigger", "LTP", "Change %"]
+DISPLAY_COLS = ["Symbol", "Strike", "Trigger", "LTP", "Change %", "TGT", "SL", "Status"]
+def style_status(value):
+    if value == "TGT Hit":
+        return "background-color: darkgreen; color: white; font-weight: bold;"
+    if value == "SL Hit":
+        return "background-color: #B71C1C; color: white; font-weight: bold;"
+    if value == "Open":
+        return "background-color: #FFF59D; color: black; font-weight: bold;"
+    return ""
 def show_side_by_side(ce_table, pe_table):
     last_updated = get_ist_now().strftime("%H:%M:%S")
     st.caption(f"Last Updated: {last_updated} IST")
@@ -712,6 +815,7 @@ def show_side_by_side(ce_table, pe_table):
                 styled = (
                     table[DISPLAY_COLS].style
                     .map(style_change_percent, subset=["Change %"])
+                    .map(style_status, subset=["Status"])
                     .format(DECIMAL_COLS, na_rep="-")
                 )
                 st.dataframe(styled, width="stretch", hide_index=True, height=table_height(table))
@@ -729,6 +833,8 @@ if is_client_view:
     auto_refresh = True
     refresh_interval = 15
     expiry_type = "Current Month"
+    tgt_pct = DEFAULT_TGT_PCT
+    sl_pct = DEFAULT_SL_PCT
     telegram_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
     telegram_enabled = bool(telegram_bot_token and telegram_chat_id)
@@ -752,6 +858,16 @@ else:
             options=["Current Month", "Next Month"],
             index=0,
             help="Which monthly expiry's ATM options the scanner tracks."
+        )
+        st.markdown("---")
+        st.header("Levels")
+        tgt_pct = st.number_input(
+            "Target %", min_value=1.0, max_value=1000.0, value=DEFAULT_TGT_PCT, step=5.0,
+            help="TGT = Trigger x (1 + Target%/100). 50 -> Trigger x 1.5."
+        )
+        sl_pct = st.number_input(
+            "Stop Loss %", min_value=1.0, max_value=99.0, value=DEFAULT_SL_PCT, step=5.0,
+            help="SL = Trigger x (1 - SL%/100). 50 -> Trigger x 0.5."
         )
         st.markdown("---")
         st.header("Bhavcopy")
@@ -808,13 +924,13 @@ if not access_token:
 else:
     st.header("PDL x2 Breakout (Live)")
     st.caption(
-        f"Trigger = PDL x{ENTRY_MULT:g}  |  Change % = LTP / Trigger"
+        f"Trigger = PDL x{ENTRY_MULT:g}  |  TGT = Trigger +{tgt_pct:g}%  |  SL = Trigger -{sl_pct:g}%  |  Status uses LTP"
         + (f"  |  Bhavcopy date: {bhavcopy_date}" if bhavcopy_date else "")
     )
     @st.fragment(run_every=run_every)
     def show_scanner():
         ce_table, pe_table, all_df = build_scanner(
-            access_token, expiry_type, bhavcopy_price_map, bhavcopy_low_map
+            access_token, expiry_type, bhavcopy_price_map, bhavcopy_low_map, tgt_pct, sl_pct
         )
         if telegram_enabled and not all_df.empty:
             check_and_alert(all_df, telegram_enabled, telegram_bot_token, telegram_chat_id)
