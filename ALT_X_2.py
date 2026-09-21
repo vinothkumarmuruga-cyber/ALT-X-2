@@ -442,6 +442,11 @@ ENTRY_MULT = 2.0   # Entry = ATL * ENTRY_MULT
 EXIT_MULT = 2.0    # TGT   = Entry * EXIT_MULT
 SL_MULT = 0.5      # SL    = Entry * SL_MULT
 MIN_ATL = 3.0      # Options whose ATL is below this (in rupees) are dropped from the table entirely
+# Bump this whenever the per-contract info dict built by
+# _fetch_single_atl_data changes shape. fetch_atl_map is cached for 30 min
+# and Streamlit only tracks that function's own code, so without a new
+# key here an old cached result (missing new fields) keeps being served.
+ATL_CACHE_VERSION = 2
 ATL_HIST_UNIT = "days"
 ATL_HIST_INTERVAL = "1"
 def fetch_atl_history(instrument_key, headers, from_date, to_date, max_retries=2):
@@ -554,7 +559,7 @@ def _fetch_single_atl_data(instrument_key, headers, from_date, to_date, max_retr
     }
     return instrument_key, info, None
 @st.cache_data(ttl=1800, show_spinner="Scanning ATL look-back history...")
-def fetch_atl_map(instrument_keys, headers_tuple, from_date_iso, to_date_iso):
+def fetch_atl_map(instrument_keys, headers_tuple, from_date_iso, to_date_iso, cache_version):
     headers = dict(headers_tuple)
     from_date = datetime.strptime(from_date_iso, "%Y-%m-%d").date()
     to_date = datetime.strptime(to_date_iso, "%Y-%m-%d").date()
@@ -900,6 +905,7 @@ def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_ma
         tuple(headers.items()),
         from_date.isoformat(),
         to_date.isoformat(),
+        ATL_CACHE_VERSION,
     )
     def _atl_field(key, field, default=None):
         info = atl_map.get(key)
@@ -927,9 +933,14 @@ def build_atl_scanner(access_token, expiry_choice, start_date, bhavcopy_price_ma
     # any earlier date are dropped.
     if last_session_only:
         session_dates = [i["last_date"] for i in atl_map.values() if i and i.get("last_date")]
-        if not session_dates:
-            return pd.DataFrame(), pd.DataFrame()
-        last_session = max(session_dates)
+        if session_dates:
+            last_session = max(session_dates)
+        else:
+            # Fallback: previous weekday (holidays not accounted for).
+            d = today - timedelta(days=1)
+            while d.weekday() >= 5:
+                d -= timedelta(days=1)
+            last_session = d.strftime("%Y-%m-%d")
         selected = selected[selected["ATL Date"] == last_session].reset_index(drop=True)
         st.caption(f"Showing only strikes whose ATL Date is the last trading session ({last_session}): {len(selected)}")
         if selected.empty:
